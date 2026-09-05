@@ -1,0 +1,2402 @@
+---
+title: "Global Life Expectancy"
+author: "Parimah Alsafi"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.align  = "center",
+  dpi        = 120,
+  cache      = FALSE,
+  comment    = "#>"
+)
+options(scipen = 999, digits = 4)
+set.seed(2024)
+```
+
+# Setup
+
+## Required packages
+
+```{r pkg-install, eval=FALSE}
+# Run once. Nothing below installs packages silently.
+core <- c("tidyverse", "knitr", "broom", "patchwork", "scales")
+stat <- c("car", "lmtest", "MASS", "sandwich")
+mixd <- c("lme4", "lmerTest", "broom.mixed", "performance")
+regu <- c("glmnet")
+ml   <- c("ranger", "xgboost")
+miss <- c("mice")
+clsf <- c("nnet", "class")
+extra <- c("kableExtra", "GGally", "naniar")   # optional, document degrades gracefully
+
+install.packages(c(core, stat, mixd, regu, ml, miss, clsf, extra))
+```
+
+```{r}
+remove.packages("stringi")
+remove.packages("stringr")
+
+install.packages("stringi", type = "source")
+install.packages("stringr")
+```
+
+```{r}
+library(stringi)
+library(stringr)
+```
+
+
+```{r pkg-load}
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ggplot2); library(readr)
+  library(purrr); library(tibble); library(forcats)
+  library(knitr)
+})
+
+## Optional packages are guarded so the document always knits.
+has <- function(p) requireNamespace(p, quietly = TRUE)
+
+PKG <- list(
+  car        = has("car"),        lmtest   = has("lmtest"),
+  MASS       = has("MASS"),       lme4     = has("lme4"),
+  lmerTest   = has("lmerTest"),   glmnet   = has("glmnet"),
+  ranger     = has("ranger"),     xgboost  = has("xgboost"),
+  mice       = has("mice"),       nnet     = has("nnet"),
+  class      = has("class"),      broom    = has("broom"),
+  broom.mixed = has("broom.mixed"), patchwork = has("patchwork")
+)
+
+tibble(package = names(PKG), available = unlist(PKG)) |>
+  arrange(available, package) |>
+  kable(caption = "Availability of analysis packages")
+```
+
+```{r theme}
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(colour = "grey35", size = 10),
+      panel.grid.minor = element_blank(),
+      strip.text    = element_text(face = "bold")
+    )
+)
+pal_status <- c("Developed" = "#1b6ca8", "Developing" = "#e07b39")
+```
+
+## Analysis configuration
+
+```{r config}
+CFG <- list(
+  data_path        = "data/raw/Life Expectancy Data.csv",
+  drop_missing_y   = TRUE,   
+  fix_bmi          = TRUE,    
+  fix_population   = FALSE,   
+  primary_data     = "imputed",  
+  n_folds          = 5,       
+  temporal_cutoff  = 2012,    
+  test_interpolate = TRUE,  
+  run_mice         = TRUE,    
+  mice_m           = 5,
+  mice_maxit       = 5,
+  run_xgboost      = TRUE,
+  tune_ml          = TRUE,    
+  rf_trees         = 500,
+  seed             = 2024
+)
+set.seed(CFG$seed)
+```
+
+---
+
+# Part 1 --- Data Audit
+
+```{r load-data}
+normalize_names <- function(x) {
+  x <- tolower(trimws(x))
+  x <- gsub("[^a-z0-9]+", "_", x)
+  x <- gsub("_+", "_", x)
+  gsub("^_|_$", "", x)
+}
+
+read_life_expectancy <- function(path) {
+  candidates <- c(
+    path,
+    "Life Expectancy Data.csv",
+    "data/Life Expectancy Data.csv",
+    "data/raw/Life_Expectancy_Data.csv"
+  )
+  hit <- candidates[file.exists(candidates)]
+  if (!length(hit)) {
+    stop(
+      "Data file not found. Download the Kaggle dataset and place ",
+      "'Life Expectancy Data.csv' in data/raw/. Looked in:\n  ",
+      paste(candidates, collapse = "\n  "),
+      call. = FALSE
+    )
+  }
+  readr::read_csv(hit[1], show_col_types = FALSE, progress = FALSE)
+}
+
+raw <- read_life_expectancy(CFG$data_path)
+names(raw) <- normalize_names(names(raw))
+
+# regex -> canonical name
+rename_map <- c(
+  country                = "^country$",
+  year                   = "^year$",
+  status                 = "^status$",
+  life_expectancy        = "life.*expect",
+  adult_mortality        = "adult.*mortal",
+  infant_deaths          = "infant.*death",
+  alcohol                = "^alcohol",
+  percentage_expenditure = "percentage.*expend",
+  hepatitis_b            = "hepatitis",
+  measles                = "measles",
+  bmi                    = "^bmi$",
+  under_five_deaths      = "under.*five.*death",
+  polio                  = "^polio",
+  total_expenditure      = "total.*expend",
+  diphtheria             = "diphther",
+  hiv_aids               = "hiv",
+  gdp                    = "^gdp$",
+  population             = "^population$",
+  thinness_10_19         = "thinness.*(1_19|10_19)",
+  thinness_5_9           = "thinness.*5_9",
+  income_composition     = "income.*composition",
+  schooling              = "schooling"
+)
+
+apply_rename <- function(df, map) {
+  nm <- names(df)
+  for (target in names(map)) {
+    idx <- grep(map[[target]], nm)
+    if (length(idx) >= 1) nm[idx[1]] <- target
+  }
+  names(df) <- nm
+  df
+}
+
+life <- apply_rename(raw, rename_map)
+
+missing_core <- setdiff(c("country", "year", "life_expectancy"), names(life))
+if (length(missing_core)) {
+  stop("Essential columns not recognised: ", paste(missing_core, collapse = ", "))
+}
+
+life <- life |>
+  mutate(
+    country = as.character(country),
+    year    = as.integer(year),
+    status  = factor(status, levels = c("Developing", "Developed"))
+  )
+
+cat("Dimensions:", nrow(life), "rows x", ncol(life), "columns\n")
+```
+
+## Structure of the panel
+
+```{r audit-structure}
+audit_overview <- tibble(
+  metric = c("Observations", "Countries", "Years", "First year", "Last year",
+             "Variables", "Duplicated (country, year) rows"),
+  value  = c(nrow(life),
+             n_distinct(life$country),
+             n_distinct(life$year),
+             min(life$year, na.rm = TRUE),
+             max(life$year, na.rm = TRUE),
+             ncol(life),
+             sum(duplicated(life[c("country", "year")])))
+)
+kable(audit_overview, caption = "Panel overview")
+```
+
+```{r audit-types}
+var_type <- function(x) {
+  if (is.factor(x) || is.character(x)) "categorical"
+  else if (is.integer(x)) "integer / temporal"
+  else "continuous"
+}
+
+audit_vars <- tibble(
+  variable  = names(life),
+  type      = vapply(life, var_type, character(1)),
+  n_missing = vapply(life, function(x) sum(is.na(x)), integer(1)),
+  pct_missing = round(100 * n_missing / nrow(life), 1),
+  n_unique  = vapply(life, function(x) dplyr::n_distinct(x), integer(1)),
+  min       = vapply(life, function(x) if (is.numeric(x)) min(x, na.rm = TRUE) else NA_real_, numeric(1)),
+  max       = vapply(life, function(x) if (is.numeric(x)) max(x, na.rm = TRUE) else NA_real_, numeric(1))
+)
+kable(audit_vars, caption = "Variable dictionary, ranges and missingness", digits = 2)
+```
+
+## Observations per country
+
+
+```{r audit-balance}
+per_country <- life |> count(country, name = "n_years")
+
+kable(
+  per_country |> count(n_years, name = "n_countries") |> arrange(desc(n_years)),
+  caption = "Distribution of the number of observed years per country"
+)
+
+per_country |>
+  filter(n_years < max(n_years)) |>
+  arrange(n_years) |>
+  head(15) |>
+  kable(caption = "Countries with an incomplete time series (first 15)")
+```
+
+```{r audit-balance-plot, fig.height=3.4}
+ggplot(per_country, aes(n_years)) +
+  geom_bar(fill = "#1b6ca8", alpha = .85) +
+  labs(title = "Panel is close to balanced but not exactly balanced",
+       subtitle = "Number of observed years per country",
+       x = "Years observed", y = "Countries")
+```
+
+```{r audit-implausible}
+rule <- function(data, var, condition, description) {
+  if (!var %in% names(data)) return(NULL)
+  n <- sum(condition, na.rm = TRUE)
+  tibble(variable = var, rule = description, n_flagged = n,
+         pct = round(100 * n / nrow(data), 2))
+}
+
+flags <- bind_rows(
+  rule(life, "life_expectancy", life$life_expectancy < 20 | life$life_expectancy > 100,
+       "outside 20-100 years"),
+  rule(life, "bmi", life$bmi < 10 | life$bmi > 60,
+       "national mean BMI outside 10-60"),
+  rule(life, "adult_mortality", life$adult_mortality < 20,
+       "adult mortality < 20 per 1000 (suspected truncated digit)"),
+  rule(life, "infant_deaths", life$infant_deaths == 0,
+       "exactly zero infant deaths"),
+  rule(life, "under_five_deaths", life$under_five_deaths == 0,
+       "exactly zero under-five deaths"),
+  rule(life, "population", life$population < 1000,
+       "population below 1000"),
+  rule(life, "percentage_expenditure", life$percentage_expenditure == 0,
+       "zero health expenditure share")
+)
+kable(flags, caption = "Range / plausibility checks on the raw data")
+```
+
+```{r audit-fix}
+n_bmi <- sum(!is.na(life$bmi) & (life$bmi < 10 | life$bmi > 60))
+if (CFG$fix_bmi) {
+  life <- life |> mutate(bmi = ifelse(!is.na(bmi) & (bmi < 10 | bmi > 60), NA_real_, bmi))
+}
+if (CFG$fix_population) {
+  life <- life |> mutate(population = ifelse(!is.na(population) & population < 1000,
+                                             NA_real_, population))
+}
+cat(sprintf("BMI values sent to NA: %s\nPopulation values sent to NA: %s\n",
+            if (CFG$fix_bmi) n_bmi else "0 (rule disabled - flagged only)",
+            if (CFG$fix_population) "applied" else "0 (rule disabled - flagged only)"))
+```
+
+
+
+```{r derive}
+log1p_safe <- function(x) ifelse(is.na(x), NA_real_, log1p(pmax(x, 0)))
+
+life <- life |>
+  mutate(
+    log_gdp        = log1p_safe(gdp),
+    log_population = log1p_safe(population),
+    log_measles    = log1p_safe(measles),
+    log_hiv        = log1p_safe(hiv_aids),
+    year_c         = year - min(year, na.rm = TRUE)   # 0 = first observed year
+  )
+
+if (CFG$drop_missing_y) {
+  n_before <- nrow(life)
+  life <- life |> filter(!is.na(life_expectancy))
+  cat("Rows dropped for a missing outcome:", n_before - nrow(life), "\n")
+}
+
+life <- life |> arrange(country, year)
+```
+
+---
+
+# Part 2 --- Missing Data Analysis
+
+
+## Missing rate per variable
+
+
+```{r miss-rate, fig.height=5.5}
+miss_tbl <- life |>
+  summarise(across(everything(), ~ sum(is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") |>
+  mutate(missing_rate = n_missing / nrow(life)) |>
+  arrange(desc(missing_rate))
+
+kable(miss_tbl |> filter(n_missing > 0), digits = 3,
+      caption = "Variables with missing values")
+
+miss_tbl |>
+  filter(n_missing > 0) |>
+  ggplot(aes(x = missing_rate, y = fct_reorder(variable, missing_rate))) +
+  geom_col(fill = "#c0392b", alpha = .85) +
+  geom_text(aes(label = scales::percent(missing_rate, accuracy = .1)),
+            hjust = -0.12, size = 3.2) +
+  scale_x_continuous(labels = scales::percent, expand = expansion(mult = c(0, .18))) +
+  labs(title = "Missing rate by variable", x = "Missing rate", y = NULL)
+```
+
+## Missingness pattern
+
+```{r miss-pattern}
+miss_vars <- miss_tbl |> filter(n_missing > 0) |> pull(variable)
+
+pattern <- life |>
+  select(all_of(miss_vars)) |>
+  mutate(across(everything(), ~ as.integer(is.na(.x)))) |>
+  group_by(across(everything())) |>
+  tally(name = "n_rows") |>
+  ungroup() |>
+  arrange(desc(n_rows))
+
+cat("Rows that are fully complete:",
+    sum(complete.cases(life)), "of", nrow(life),
+    sprintf("(%.1f%%)\n", 100 * sum(complete.cases(life)) / nrow(life)))
+
+head(pattern, 8) |>
+  kable(caption = "Eight most frequent missingness patterns (1 = missing)")
+```
+
+```{r miss-by-country}
+miss_by_country <- life |>
+  select(country, all_of(miss_vars)) |>
+  pivot_longer(-country, names_to = "variable", values_to = "value",
+               values_transform = list(value = as.numeric)) |>
+  group_by(country) |>
+  summarise(pct_missing = 100 * mean(is.na(value)), .groups = "drop") |>
+  arrange(desc(pct_missing))
+
+head(miss_by_country, 12) |>
+  kable(digits = 1, caption = "Countries with the highest share of missing cells")
+```
+
+```{r miss-heat, fig.height=6.5}
+life |>
+  select(country, year, all_of(miss_vars)) |>
+  pivot_longer(-c(country, year), names_to = "variable", values_to = "value") |>
+  group_by(variable, year) |>
+  summarise(missing_rate = mean(is.na(value)), .groups = "drop") |>
+  ggplot(aes(year, fct_rev(variable), fill = missing_rate)) +
+  geom_tile(colour = "white", linewidth = .3) +
+  scale_fill_gradient(low = "#f7f7f7", high = "#c0392b", labels = scales::percent) +
+  labs(title = "Missingness is structured in time, not random",
+       subtitle = "Share of countries missing each variable, by year",
+       x = NULL, y = NULL, fill = "Missing")
+```
+
+
+
+```{r impute-strategies}
+NUM_VARS <- life |>
+  select(where(is.numeric)) |>
+  select(-any_of(c("year", "year_c"))) |>
+  names()
+
+DERIVED_VARS <- c("log_gdp", "log_population", "log_measles", "log_hiv")
+# never impute the outcome; derived logs are rebuilt after imputation
+IMPUTE_VARS  <- setdiff(NUM_VARS, c("life_expectancy", DERIVED_VARS))
+
+## --- Strategy 1: complete cases -------------------------------------------
+dat_cc <- life |> tidyr::drop_na(all_of(c("life_expectancy", IMPUTE_VARS)))
+
+## --- Strategy 2: panel-aware imputation, as an estimator -------------------
+
+# interior gaps only - no extrapolation past the first / last observed year
+interp_interior <- function(x, t) {
+  ok <- !is.na(x)
+  if (sum(ok) < 2) return(x)
+  as.numeric(stats::approx(t[ok], x[ok], xout = t, rule = 1)$y)
+}
+
+# last observation carried forward: uses the past only
+locf <- function(x) {
+  idx <- cummax(seq_along(x) * as.integer(!is.na(x)))
+  idx[idx == 0] <- NA_integer_
+  x[idx]
+}
+
+# LEARN the imputation parameters (training data only)
+impute_fit <- function(train, vars = IMPUTE_VARS) {
+  list(
+    vars = vars,
+    status_year = train |>
+      group_by(status, year) |>
+      summarise(across(all_of(vars), ~ stats::median(.x, na.rm = TRUE)), .groups = "drop"),
+    global = train |>
+      summarise(across(all_of(vars), ~ stats::median(.x, na.rm = TRUE)))
+  )
+}
+
+impute_apply <- function(newdata, params, history = NULL,
+                         mode = c("interior", "causal")) {
+  mode <- match.arg(mode)
+  vars <- params$vars
+  new  <- newdata |> mutate(.rid = dplyr::row_number())
+  cols <- c("country", "year", vars, ".rid")
+
+  hist_part <- if (is.null(history)) NULL else
+    history |> mutate(.rid = NA_integer_) |> select(all_of(cols))
+
+  comb <- bind_rows(hist_part, new |> select(all_of(cols))) |>
+    arrange(country, year) |>
+    group_by(country)
+
+  comb <- if (mode == "interior") {
+    comb |> mutate(across(all_of(vars), ~ locf(interp_interior(.x, year))))
+  } else {
+    comb |> mutate(across(all_of(vars), locf))     # backwards-looking only
+  }
+
+  filled <- comb |> ungroup() |> filter(!is.na(.rid)) |> arrange(.rid)
+  new[vars] <- filled[vars]
+
+  new <- left_join(new, params$status_year, by = c("status", "year"),
+                   suffix = c("", ".sy"))
+  for (v in vars) {
+    sy <- paste0(v, ".sy")
+    if (sy %in% names(new)) {
+      new[[v]] <- ifelse(is.na(new[[v]]), new[[sy]], new[[v]])
+      new[[sy]] <- NULL
+    }
+  }
+  for (v in vars) new[[v]] <- ifelse(is.na(new[[v]]), params$global[[v]], new[[v]])
+
+  new |>
+    select(-.rid) |>
+    mutate(log_gdp        = log1p_safe(gdp),
+           log_population = log1p_safe(population),
+           log_measles    = log1p_safe(measles),
+           log_hiv        = log1p_safe(hiv_aids))
+}
+
+
+dat_imp <- impute_apply(life, impute_fit(life), mode = "interior")
+
+## --- Strategy 3: multiple imputation (mice) is run in Part 20 --------------
+
+tibble(
+  dataset  = c("Complete cases", "Panel-aware imputation", "Original"),
+  rows     = c(nrow(dat_cc), nrow(dat_imp), nrow(life)),
+  countries = c(n_distinct(dat_cc$country), n_distinct(dat_imp$country),
+                n_distinct(life$country)),
+  remaining_NA = c(sum(is.na(dat_cc[IMPUTE_VARS])),
+                   sum(is.na(dat_imp[IMPUTE_VARS])),
+                   sum(is.na(life[IMPUTE_VARS])))
+) |>
+  kable(caption = "What each missing-data strategy costs")
+```
+
+```{r impute-cost, fig.height=3.6}
+lost <- setdiff(unique(life$country), unique(dat_cc$country))
+cat("Countries lost entirely by complete-case analysis:", length(lost), "\n")
+if (length(lost)) cat(paste(utils::head(sort(lost), 20), collapse = ", "), "\n")
+
+bind_rows(
+  life   |> transmute(life_expectancy, set = "All rows"),
+  dat_cc |> transmute(life_expectancy, set = "Complete cases")
+) |>
+  ggplot(aes(life_expectancy, fill = set)) +
+  geom_density(alpha = .45, colour = NA) +
+  scale_fill_manual(values = c("All rows" = "grey40", "Complete cases" = "#1b6ca8")) +
+  labs(title = "Complete-case filtering shifts the outcome distribution",
+       subtitle = "Evidence that the missingness is not ignorable",
+       x = "Life expectancy (years)", y = "Density", fill = NULL)
+```
+
+
+```{r pick-primary}
+dat <- if (identical(CFG$primary_data, "complete_case")) dat_cc else dat_imp
+cat("Primary analysis dataset:", CFG$primary_data,
+    "-", nrow(dat), "rows,", n_distinct(dat$country), "countries\n")
+
+
+panel <- life
+stopifnot(identical(panel$country, dat_imp$country),
+          identical(panel$year, dat_imp$year))
+
+PRED_FULL <- intersect(
+  c("schooling", "income_composition", "adult_mortality", "infant_deaths",
+    "under_five_deaths", "alcohol", "percentage_expenditure", "hepatitis_b",
+    "log_measles", "bmi", "polio", "total_expenditure", "diphtheria",
+    "log_hiv", "log_gdp", "log_population", "thinness_10_19", "thinness_5_9"),
+  names(dat)
+)
+```
+
+---
+
+# Part 3 --- Exploratory Data Analysis
+
+## Distribution of the outcome
+
+```{r eda-outcome, fig.height=6.5}
+p_hist <- ggplot(dat, aes(life_expectancy)) +
+  geom_histogram(bins = 40, fill = "#1b6ca8", colour = "white", alpha = .9) +
+  labs(title = "Histogram", x = "Life expectancy (years)", y = "Count")
+
+p_dens <- ggplot(dat, aes(life_expectancy)) +
+  geom_density(fill = "#1b6ca8", alpha = .35, colour = "#1b6ca8") +
+  labs(title = "Density", x = "Life expectancy (years)", y = NULL)
+
+p_box <- ggplot(dat, aes(y = life_expectancy)) +
+  geom_boxplot(fill = "#1b6ca8", alpha = .5, width = .4) +
+  labs(title = "Boxplot", y = "Life expectancy (years)", x = NULL) +
+  theme(axis.text.x = element_blank())
+
+p_qq <- ggplot(dat, aes(sample = life_expectancy)) +
+  stat_qq(colour = "#1b6ca8", alpha = .5, size = .8) + stat_qq_line() +
+  labs(title = "Normal Q-Q", x = "Theoretical", y = "Sample")
+
+if (PKG$patchwork) {
+  (p_hist + p_dens) / (p_box + p_qq)
+} else {
+  print(p_hist); print(p_dens); print(p_box); print(p_qq)
+}
+```
+
+```{r eda-summary}
+num_summary <- function(x) {
+  c(n = sum(!is.na(x)), mean = mean(x, na.rm = TRUE), sd = stats::sd(x, na.rm = TRUE),
+    min = min(x, na.rm = TRUE),
+    q25 = stats::quantile(x, .25, na.rm = TRUE, names = FALSE),
+    median = stats::median(x, na.rm = TRUE),
+    q75 = stats::quantile(x, .75, na.rm = TRUE, names = FALSE),
+    max = max(x, na.rm = TRUE),
+    skew = mean((x - mean(x, na.rm = TRUE))^3, na.rm = TRUE) /
+           stats::sd(x, na.rm = TRUE)^3)
+}
+
+dat |>
+  select(all_of(c("life_expectancy", PRED_FULL))) |>
+  map_dfr(num_summary, .id = "variable") |>
+  kable(digits = 2, caption = "Summary statistics for the outcome and predictors")
+```
+
+
+## Distributions of the main predictors
+
+```{r eda-predictors, fig.height=8}
+dat |>
+  select(all_of(PRED_FULL)) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |>
+  ggplot(aes(value)) +
+  geom_histogram(bins = 35, fill = "#e07b39", colour = "white", alpha = .9) +
+  facet_wrap(~ variable, scales = "free", ncol = 4) +
+  labs(title = "Predictor distributions", x = NULL, y = NULL) +
+  theme(axis.text = element_text(size = 7))
+```
+
+## Country trajectories
+
+
+```{r eda-traj, fig.height=5}
+focus <- intersect(
+  c("Germany", "Iran (Islamic Republic of)", "India", "Nigeria", "Japan", "Brazil",
+    "South Africa", "Rwanda"),
+  unique(dat$country)
+)
+if (length(focus) < 4) focus <- sample(unique(dat$country), 8)
+
+ggplot(dat, aes(year, life_expectancy, group = country)) +
+  geom_line(colour = "grey82", linewidth = .3) +
+  geom_line(data = filter(dat, country %in% focus),
+            aes(colour = country), linewidth = 1) +
+  labs(title = "Countries do not share one trajectory",
+       subtitle = "Grey: all countries. Coloured: selected countries",
+       x = NULL, y = "Life expectancy (years)", colour = NULL)
+```
+
+
+
+```{r eda-change, fig.height=4.2}
+change <- dat |>
+  group_by(country) |>
+  filter(year %in% range(year)) |>
+  summarise(status = dplyr::first(status),
+            start = life_expectancy[which.min(year)],
+            end   = life_expectancy[which.max(year)],
+            gain  = end - start, .groups = "drop")
+
+r_conv <- stats::cor(change$start, change$gain, use = "complete.obs")
+conv_txt <- sprintf("Correlation between starting level and subsequent gain: r = %.2f (%s)",
+                    r_conv,
+                    if (r_conv < -0.1) "convergence" else if (r_conv > 0.1)
+                      "divergence" else "no clear pattern")
+
+ggplot(change, aes(start, gain, colour = status)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey50") +
+  geom_point(alpha = .75, size = 2) +
+  geom_smooth(method = "lm", se = FALSE, colour = "black", linewidth = .6) +
+  scale_colour_manual(values = pal_status) +
+  labs(title = "Starting level against subsequent change",
+       subtitle = conv_txt,
+       x = "Life expectancy in the first observed year",
+       y = "Change over the observation window (years)", colour = NULL)
+```
+
+## Developed vs Developing
+
+```{r eda-status, fig.height=4.2}
+p1 <- ggplot(dat, aes(status, life_expectancy, fill = status)) +
+  geom_violin(alpha = .35, colour = NA) +
+  geom_boxplot(width = .18, outlier.size = .6, alpha = .9) +
+  scale_fill_manual(values = pal_status) +
+  labs(title = "Distribution by development status", x = NULL,
+       y = "Life expectancy (years)") +
+  theme(legend.position = "none")
+
+p2 <- dat |>
+  group_by(status, year) |>
+  summarise(m = mean(life_expectancy), .groups = "drop") |>
+  ggplot(aes(year, m, colour = status)) +
+  geom_line(linewidth = 1.1) +
+  scale_colour_manual(values = pal_status) +
+  labs(title = "Mean over time", x = NULL, y = NULL, colour = NULL)
+
+if (PKG$patchwork) p1 + p2 else { print(p1); print(p2) }
+```
+
+### Descriptive comparison
+
+
+```{r eda-status-desc}
+pooled_sd <- function(x, g) {
+  s <- split(x, g); n <- lengths(s); v <- vapply(s, stats::var, numeric(1))
+  sqrt(sum((n - 1) * v) / (sum(n) - length(n)))
+}
+grp_means <- tapply(dat$life_expectancy, dat$status, mean)
+cohen_d <- unname((grp_means[["Developed"]] - grp_means[["Developing"]]) /
+                    pooled_sd(dat$life_expectancy, dat$status))
+
+# country-level means: one row per country, which at least removes the within-country
+# replication (it does not fix the unequal series lengths)
+country_level <- dat |>
+  group_by(country, status) |>
+  summarise(mean_le = mean(life_expectancy), .groups = "drop")
+
+bind_rows(
+  dat |> group_by(status) |>
+    summarise(unit = "country-year rows", n = n(), mean = mean(life_expectancy),
+              median = stats::median(life_expectancy), sd = stats::sd(life_expectancy),
+              .groups = "drop"),
+  country_level |> group_by(status) |>
+    summarise(unit = "country means", n = n(), mean = mean(mean_le),
+              median = stats::median(mean_le), sd = stats::sd(mean_le), .groups = "drop")
+) |>
+  select(unit, status, n, mean, median, sd) |>
+  kable(digits = 2,
+        caption = "Descriptive comparison at two levels of aggregation (no p-values)")
+
+cat(sprintf("Raw difference in means: %.2f years | Cohen's d (descriptive): %.2f\n",
+            grp_means[["Developed"]] - grp_means[["Developing"]], cohen_d))
+```
+
+### The same comparison with a model that respects the panel
+
+
+```{r eda-status-mixed, eval=PKG$lme4}
+m_status <- (if (PKG$lmerTest) lmerTest::lmer else lme4::lmer)(
+  life_expectancy ~ status + (1 | country), data = dat, REML = TRUE)
+
+st <- as.data.frame(stats::coef(summary(m_status)))
+st$term <- rownames(st)
+st |> as_tibble() |> select(term, everything()) |>
+  kable(digits = 3,
+        caption = "Status difference estimated with a country random intercept")
+
+vs <- as.data.frame(lme4::VarCorr(m_status))
+cat(sprintf("Between-country SD: %.2f years | residual SD: %.2f years\n",
+            sqrt(vs$vcov[vs$grp == "country"]), sqrt(vs$vcov[vs$grp == "Residual"])))
+```
+
+
+## Predictors against the outcome
+
+```{r eda-scatter, fig.height=7}
+key <- intersect(c("schooling", "income_composition", "adult_mortality", "log_hiv",
+                   "log_gdp", "bmi", "alcohol", "thinness_10_19"), names(dat))
+
+dat |>
+  select(life_expectancy, status, all_of(key)) |>
+  pivot_longer(-c(life_expectancy, status), names_to = "variable", values_to = "value") |>
+  ggplot(aes(value, life_expectancy)) +
+  geom_point(aes(colour = status), alpha = .22, size = .7) +
+  geom_smooth(method = "loess", se = FALSE, colour = "black", linewidth = .7) +
+  scale_colour_manual(values = pal_status) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 4) +
+  labs(title = "Marginal relationships with life expectancy",
+       subtitle = "Black line: LOESS smoother, no model assumed",
+       x = NULL, y = "Life expectancy (years)", colour = NULL)
+```
+
+---
+
+# Part 4 --- Correlation Analysis
+
+```{r corr, fig.height=7.5}
+cor_mat <- dat |>
+  select(all_of(c("life_expectancy", PRED_FULL))) |>
+  cor(use = "pairwise.complete.obs")
+
+cor_long <- as.data.frame(as.table(cor_mat)) |>
+  setNames(c("var1", "var2", "r"))
+
+ord <- stats::hclust(stats::as.dist(1 - abs(cor_mat)))$order
+lvl <- colnames(cor_mat)[ord]
+
+cor_long |>
+  mutate(var1 = factor(var1, levels = lvl), var2 = factor(var2, levels = lvl)) |>
+  ggplot(aes(var1, var2, fill = r)) +
+  geom_tile(colour = "white", linewidth = .25) +
+  scale_fill_gradient2(low = "#c0392b", mid = "white", high = "#1b6ca8",
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(title = "Correlation matrix (hierarchically ordered)",
+       subtitle = "Linear association only - not causality, not independence",
+       x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        axis.text.y = element_text(size = 8))
+```
+
+```{r corr-tables}
+cor_long |>
+  filter(var1 == "life_expectancy", var2 != "life_expectancy") |>
+  arrange(desc(abs(r))) |>
+  transmute(predictor = var2, correlation_with_life_expectancy = r) |>
+  kable(digits = 3, caption = "Predictors ranked by absolute correlation with the outcome")
+
+cor_long |>
+  filter(as.character(var1) < as.character(var2), abs(r) > 0.7) |>
+  arrange(desc(abs(r))) |>
+  kable(digits = 3, caption = "Predictor pairs with |r| > 0.7 (multicollinearity watchlist)")
+```
+
+---
+
+# Part 5 --- Baseline Model
+
+
+```{r metrics-helpers}
+rmse <- function(obs, pred) sqrt(mean((obs - pred)^2, na.rm = TRUE))
+mae  <- function(obs, pred) mean(abs(obs - pred), na.rm = TRUE)
+r2   <- function(obs, pred) 1 - sum((obs - pred)^2, na.rm = TRUE) /
+                                sum((obs - mean(obs, na.rm = TRUE))^2, na.rm = TRUE)
+
+eval_metrics <- function(obs, pred) {
+  tibble(RMSE = rmse(obs, pred), MAE = mae(obs, pred), R2 = r2(obs, pred))
+}
+
+# broom-free coefficient table (works even without broom installed)
+tidy_fit <- function(model, conf = TRUE) {
+  co <- summary(model)$coefficients
+  out <- tibble(term = rownames(co), estimate = co[, 1], std.error = co[, 2],
+                statistic = co[, 3], p.value = co[, 4])
+  if (conf) {
+    ci <- suppressMessages(stats::confint(model))
+    out$conf.low  <- ci[out$term, 1]
+    out$conf.high <- ci[out$term, 2]
+  }
+  out
+}
+
+stars <- function(p) cut(p, c(-Inf, .001, .01, .05, .1, Inf),
+                         labels = c("***", "**", "*", ".", ""), right = FALSE)
+```
+
+```{r baseline}
+m_base <- lm(life_expectancy ~ schooling, data = dat)
+
+tidy_fit(m_base) |>
+  mutate(sig = stars(p.value)) |>
+  kable(digits = 4, caption = "Baseline model: life expectancy on schooling")
+
+bind_cols(
+  tibble(model = "Baseline (schooling only)"),
+  eval_metrics(dat$life_expectancy, fitted(m_base)),
+  tibble(adj_R2 = summary(m_base)$adj.r.squared,
+         AIC = stats::AIC(m_base), BIC = stats::BIC(m_base))
+) |>
+  kable(digits = 3, caption = "In-sample fit of the baseline model")
+```
+
+```{r baseline-plot, fig.height=4.2}
+ggplot(dat, aes(schooling, life_expectancy)) +
+  geom_point(aes(colour = status), alpha = .25, size = .8) +
+  geom_smooth(method = "lm", colour = "black", fill = "grey70") +
+  scale_colour_manual(values = pal_status) +
+  labs(title = "Baseline fit",
+       subtitle = "A single straight line through a curved, clustered cloud",
+       x = "Years of schooling", y = "Life expectancy (years)", colour = NULL)
+```
+
+---
+
+# Part 6 --- Multiple Linear Regression
+
+```{r mlr}
+form_full <- stats::reformulate(c(PRED_FULL, "status", "year_c"),
+                                response = "life_expectancy")
+m_full <- lm(form_full, data = dat)
+
+tidy_fit(m_full) |>
+  mutate(sig = stars(p.value)) |>
+  arrange(p.value) |>
+  kable(digits = 4, caption = "Full multiple regression (ordered by p-value)")
+```
+
+```{r mlr-fit}
+bind_rows(
+  bind_cols(tibble(model = "Baseline"),
+            eval_metrics(dat$life_expectancy, fitted(m_base)),
+            tibble(adj_R2 = summary(m_base)$adj.r.squared,
+                   AIC = AIC(m_base), BIC = BIC(m_base))),
+  bind_cols(tibble(model = "Full MLR"),
+            eval_metrics(dat$life_expectancy, fitted(m_full)),
+            tibble(adj_R2 = summary(m_full)$adj.r.squared,
+                   AIC = AIC(m_full), BIC = BIC(m_full)))
+) |>
+  kable(digits = 3, caption = "Baseline vs full multiple regression (in-sample)")
+```
+
+```{r mlr-coefplot, fig.height=6}
+tidy_fit(m_full) |>
+  filter(term != "(Intercept)") |>
+  mutate(term = fct_reorder(term, estimate)) |>
+  ggplot(aes(estimate, term)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey45") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = .25,
+                 colour = "grey40") +
+  geom_point(aes(colour = p.value < .05), size = 2.4) +
+  scale_colour_manual(values = c("TRUE" = "#1b6ca8", "FALSE" = "grey65"),
+                      labels = c("TRUE" = "p < .05", "FALSE" = "n.s.")) +
+  labs(title = "Adjusted associations with life expectancy",
+       subtitle = "Coefficients with 95% confidence intervals; units differ per predictor",
+       x = "Estimated coefficient", y = NULL, colour = NULL)
+```
+
+---
+
+# Part 7 --- Regression Diagnostics
+
+## Residual analysis
+
+```{r diag-plots, fig.height=8}
+op <- graphics::par(mfrow = c(2, 2), mar = c(4.2, 4.2, 2.6, 1.2))
+plot(m_full, which = 1:4, pch = 20, col = grDevices::adjustcolor("#1b6ca8", .35))
+graphics::par(op)
+```
+
+```{r diag-resid-year, fig.height=4}
+diag_df <- dat |>
+  mutate(.fitted = fitted(m_full), .resid = stats::rstandard(m_full))
+
+ggplot(diag_df, aes(year, .resid)) +
+  geom_hline(yintercept = 0, colour = "grey40") +
+  geom_jitter(width = .2, alpha = .18, size = .7, colour = "#1b6ca8") +
+  geom_smooth(method = "loess", se = TRUE, colour = "#c0392b") +
+  labs(title = "Residuals still carry a time signal",
+       subtitle = "A pooled OLS model does not account for the global trend",
+       x = NULL, y = "Standardised residual")
+```
+
+```{r diag-resid-country, fig.height=4}
+diag_df |>
+  group_by(country) |>
+  summarise(mean_resid = mean(.resid), .groups = "drop") |>
+  ggplot(aes(mean_resid)) +
+  geom_histogram(bins = 40, fill = "#e07b39", colour = "white") +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(title = "Residuals are clustered by country",
+       subtitle = "Country means far from zero = systematic, unmodelled country effects",
+       x = "Mean standardised residual per country", y = "Countries")
+```
+
+## Heteroscedasticity
+
+```{r diag-bp, eval=PKG$lmtest}
+bp <- lmtest::bptest(m_full)
+tibble(test = "Breusch-Pagan", statistic = unname(bp$statistic),
+       df = unname(bp$parameter), p.value = bp$p.value) |>
+  kable(digits = 4, caption = "Breusch-Pagan test for heteroscedasticity")
+```
+
+
+```{r diag-robust, eval=PKG$lmtest && has("sandwich")}
+V_hc3 <- sandwich::vcovHC(m_full, type = "HC3")
+V_cl  <- tryCatch(
+  sandwich::vcovCL(m_full, cluster = dat$country, type = "HC3"),
+  error = function(e) sandwich::vcovCL(m_full, cluster = ~ country, type = "HC3")
+)
+
+rob_hc3 <- lmtest::coeftest(m_full, vcov. = V_hc3)
+rob_cl  <- lmtest::coeftest(m_full, vcov. = V_cl)
+
+se_tbl <- tibble(term = rownames(rob_cl),
+                 estimate     = rob_cl[, 1],
+                 se_classical = summary(m_full)$coefficients[, 2],
+                 se_HC3       = rob_hc3[, 2],
+                 se_cluster   = rob_cl[, 2],
+                 p_cluster    = rob_cl[, 4]) |>
+  filter(term != "(Intercept)") |>
+  mutate(inflation_vs_classical = se_cluster / se_classical)
+
+se_tbl |> arrange(desc(inflation_vs_classical)) |> head(12) |>
+  kable(digits = 4,
+        caption = "Classical vs HC3 vs country-clustered standard errors (top 12 by inflation)")
+
+cat(sprintf("Median SE inflation from clustering: x%.2f | terms significant at 5%%: %d classical vs %d clustered\n",
+            stats::median(se_tbl$inflation_vs_classical),
+            sum(summary(m_full)$coefficients[-1, 4] < .05),
+            sum(se_tbl$p_cluster < .05)))
+```
+
+## Normality of residuals
+
+```{r diag-norm}
+res <- stats::rstandard(m_full)
+sw  <- stats::shapiro.test(sample(res, min(5000, length(res))))
+tibble(test = "Shapiro-Wilk (sampled)", W = unname(sw$statistic), p.value = sw$p.value) |>
+  kable(digits = 5, caption = "Normality check on standardised residuals")
+```
+
+## Influential observations
+
+
+```{r diag-influence}
+n_obs <- nrow(dat); p_par <- length(coef(m_full))
+
+infl <- dat |>
+  select(country, year, life_expectancy) |>
+  mutate(
+    cooksD   = stats::cooks.distance(m_full),
+    leverage = stats::hatvalues(m_full),
+    dffits   = stats::dffits(m_full),
+    resid_std = stats::rstandard(m_full)
+  )
+
+thresholds <- tibble(
+  measure   = c("Cook's D", "Leverage", "DFFITS"),
+  threshold = c(4 / n_obs, 2 * p_par / n_obs, 2 * sqrt(p_par / n_obs)),
+  n_exceeding = c(sum(infl$cooksD > 4 / n_obs),
+                  sum(infl$leverage > 2 * p_par / n_obs),
+                  sum(abs(infl$dffits) > 2 * sqrt(p_par / n_obs)))
+)
+kable(thresholds, digits = 4, caption = "Influence diagnostics and conventional cut-offs")
+
+infl |> arrange(desc(cooksD)) |> head(15) |>
+  kable(digits = 4, caption = "Fifteen most influential observations")
+```
+
+```{r diag-influence-country}
+infl |>
+  group_by(country) |>
+  summarise(n_high_cook = sum(cooksD > 4 / n_obs), mean_cook = mean(cooksD),
+            .groups = "drop") |>
+  arrange(desc(n_high_cook)) |>
+  head(12) |>
+  kable(digits = 5, caption = "Countries contributing the most influential points")
+```
+
+```{r diag-dfbetas}
+dfb <- as.data.frame(stats::dfbetas(m_full))
+key_terms <- intersect(c("schooling", "adult_mortality", "log_hiv",
+                         "income_composition"), names(dfb))
+
+purrr::map_dfr(key_terms, function(tm) {
+  i <- order(abs(dfb[[tm]]), decreasing = TRUE)[1:3]
+  tibble(term = tm, country = dat$country[i], year = dat$year[i],
+         dfbeta = dfb[[tm]][i])
+}) |>
+  kable(digits = 3,
+        caption = "Observations that move key coefficients the most (top 3 per term)")
+```
+
+---
+
+# Part 8 --- Multicollinearity
+
+```{r vif, eval=PKG$car}
+get_vif <- function(model) {
+  v <- car::vif(model)
+  if (is.matrix(v)) v <- v[, "GVIF^(1/(2*Df))"]^2   # comparable to a plain VIF
+  tibble(term = names(v), VIF = as.numeric(v)) |> arrange(desc(VIF))
+}
+
+vif_full <- get_vif(m_full)
+vif_full |>
+  mutate(flag = dplyr::case_when(VIF > 10 ~ "severe", VIF > 5 ~ "moderate",
+                                 TRUE ~ "")) |>
+  kable(digits = 2, caption = "Variance inflation factors, full model")
+```
+
+```{r vif-reduce, eval=PKG$car}
+drop_high_vif <- function(data, preds, fixed = c("status", "year_c"), thresh = 5) {
+  keep <- preds
+  repeat {
+    f <- stats::reformulate(c(keep, fixed), response = "life_expectancy")
+    v <- get_vif(lm(f, data = data)) |> filter(term %in% keep)
+    if (nrow(v) == 0 || max(v$VIF) <= thresh) break
+    worst <- v$term[which.max(v$VIF)]
+    message("dropping ", worst, " (VIF = ", round(max(v$VIF), 1), ")")
+    keep <- setdiff(keep, worst)
+    if (length(keep) <= 2) break
+  }
+  keep
+}
+
+PRED_REDUCED <- drop_high_vif(dat, PRED_FULL, thresh = 5)
+cat("Retained predictors:\n  ", paste(PRED_REDUCED, collapse = ", "), "\n")
+cat("Removed for collinearity:\n  ",
+    paste(setdiff(PRED_FULL, PRED_REDUCED), collapse = ", "), "\n")
+
+form_red <- stats::reformulate(c(PRED_REDUCED, "status", "year_c"),
+                               response = "life_expectancy")
+m_red <- lm(form_red, data = dat)
+get_vif(m_red) |> kable(digits = 2, caption = "VIF after backward removal")
+```
+
+```{r vif-fallback, eval=!PKG$car}
+PRED_REDUCED <- setdiff(PRED_FULL, c("under_five_deaths", "thinness_5_9",
+                                     "percentage_expenditure"))
+form_red <- stats::reformulate(c(PRED_REDUCED, "status", "year_c"),
+                               response = "life_expectancy")
+m_red <- lm(form_red, data = dat)
+cat("car not installed - using a fixed reduced predictor set.\n")
+```
+
+```{r vif-compare}
+bind_rows(
+  bind_cols(tibble(model = "Full"), eval_metrics(dat$life_expectancy, fitted(m_full)),
+            tibble(k = length(coef(m_full)), AIC = AIC(m_full), BIC = BIC(m_full))),
+  bind_cols(tibble(model = "Reduced (VIF-pruned)"),
+            eval_metrics(dat$life_expectancy, fitted(m_red)),
+            tibble(k = length(coef(m_red)), AIC = AIC(m_red), BIC = BIC(m_red)))
+) |>
+  kable(digits = 3, caption = "Dropping collinear predictors costs almost no fit")
+```
+
+```{r vif-cost}
+r2_cost <- summary(m_full)$adj.r.squared - summary(m_red)$adj.r.squared
+cat(sprintf("Adjusted R-squared lost by pruning: %.4f (%d predictors removed)\n",
+            r2_cost, length(coef(m_full)) - length(coef(m_red))))
+```
+---
+
+# Part 9 --- Interaction Analysis
+
+
+```{r inter-fit}
+# `a*b` is used rather than `a:b` so that main effects are always retained.
+candidate_int <- c("schooling*status", "income_composition*status",
+                   "log_hiv*status", "schooling*income_composition")
+
+interaction_terms <- candidate_int[
+  vapply(strsplit(candidate_int, "[*]"),
+         function(v) all(trimws(v) %in% names(dat)), logical(1))
+]
+
+form_int <- stats::reformulate(c(PRED_REDUCED, "status", "year_c", interaction_terms),
+                               response = "life_expectancy")
+m_int <- lm(form_int, data = dat)
+
+tidy_fit(m_int) |>
+  filter(grepl(":", term)) |>
+  mutate(sig = stars(p.value)) |>
+  kable(digits = 4, caption = "Interaction terms only")
+```
+
+```{r inter-anova}
+av <- stats::anova(m_red, m_int)
+tibble(model    = c("Reduced (no interactions)", "With interactions"),
+       res_df   = av$Res.Df,
+       RSS      = av$RSS,
+       F        = av$F,
+       p.value  = av[["Pr(>F)"]]) |>
+  kable(digits = 4,
+        caption = "Classical nested F-test - shown for completeness, NOT used for inference")
+```
+
+
+
+```{r inter-mixed, eval=PKG$lme4}
+lmer_fun0 <- if (PKG$lmerTest) lmerTest::lmer else lme4::lmer
+
+int_terms_mm <- interaction_terms
+form_mm_main <- paste(c(PRED_REDUCED, "status", "year_c"), collapse = " + ")
+
+m_mm_main <- lmer_fun0(
+  stats::as.formula(paste("life_expectancy ~", form_mm_main, "+ (1 | country)")),
+  data = dat, REML = FALSE)
+
+m_mm_int <- lmer_fun0(
+  stats::as.formula(paste("life_expectancy ~", form_mm_main, "+",
+                          paste(int_terms_mm, collapse = " + "), "+ (1 | country)")),
+  data = dat, REML = FALSE)
+
+as.data.frame(stats::anova(m_mm_main, m_mm_int)) |>
+  tibble::rownames_to_column("model") |>
+  kable(digits = 3,
+        caption = "Likelihood-ratio test for the interactions, with a country random intercept")
+
+fi <- as.data.frame(stats::coef(summary(m_mm_int)))
+fi$term <- rownames(fi)
+fi |> as_tibble() |> filter(grepl(":", term)) |> select(term, everything()) |>
+  kable(digits = 4, caption = "Interaction terms estimated inside the mixed model")
+```
+
+
+```{r inter-plot, fig.height=4.4}
+grid_schooling <- tidyr::expand_grid(
+  schooling = seq(min(dat$schooling), max(dat$schooling), length.out = 60),
+  status    = factor(c("Developing", "Developed"),
+                     levels = levels(dat$status))
+)
+model_vars <- all.vars(stats::delete.response(stats::terms(m_int)))
+need_vars  <- setdiff(model_vars, c("schooling", "status"))
+others <- dat |>
+  summarise(across(all_of(need_vars),
+                   ~ if (is.numeric(.x)) stats::median(.x) else dplyr::first(.x)))
+grid_schooling <- dplyr::bind_cols(grid_schooling,
+                                   others[rep(1, nrow(grid_schooling)), , drop = FALSE])
+
+grid_schooling$pred <- stats::predict(m_int, newdata = grid_schooling)
+
+ggplot(grid_schooling, aes(schooling, pred, colour = status)) +
+  geom_line(linewidth = 1.2) +
+  scale_colour_manual(values = pal_status) +
+  labs(title = "Interaction: schooling x development status",
+       subtitle = "Other predictors held at their medians; different slopes = interaction",
+       x = "Years of schooling", y = "Predicted life expectancy", colour = NULL)
+```
+
+---
+
+# Part 10 --- Model Selection
+
+
+```{r selection, eval=PKG$MASS}
+m_step <- MASS::stepAIC(m_int, direction = "both", trace = FALSE)
+m_step_bic <- MASS::stepAIC(m_int, direction = "both", trace = FALSE,
+                            k = log(nrow(dat)))
+
+selection_tbl <- bind_rows(
+  bind_cols(tibble(model = "Baseline"), eval_metrics(dat$life_expectancy, fitted(m_base)),
+            tibble(k = length(coef(m_base)), AIC = AIC(m_base), BIC = BIC(m_base),
+                   adj_R2 = summary(m_base)$adj.r.squared)),
+  bind_cols(tibble(model = "Full"), eval_metrics(dat$life_expectancy, fitted(m_full)),
+            tibble(k = length(coef(m_full)), AIC = AIC(m_full), BIC = BIC(m_full),
+                   adj_R2 = summary(m_full)$adj.r.squared)),
+  bind_cols(tibble(model = "Reduced (VIF)"), eval_metrics(dat$life_expectancy, fitted(m_red)),
+            tibble(k = length(coef(m_red)), AIC = AIC(m_red), BIC = BIC(m_red),
+                   adj_R2 = summary(m_red)$adj.r.squared)),
+  bind_cols(tibble(model = "With interactions"), eval_metrics(dat$life_expectancy, fitted(m_int)),
+            tibble(k = length(coef(m_int)), AIC = AIC(m_int), BIC = BIC(m_int),
+                   adj_R2 = summary(m_int)$adj.r.squared)),
+  bind_cols(tibble(model = "Stepwise (AIC)"), eval_metrics(dat$life_expectancy, fitted(m_step)),
+            tibble(k = length(coef(m_step)), AIC = AIC(m_step), BIC = BIC(m_step),
+                   adj_R2 = summary(m_step)$adj.r.squared)),
+  bind_cols(tibble(model = "Stepwise (BIC)"), eval_metrics(dat$life_expectancy, fitted(m_step_bic)),
+            tibble(k = length(coef(m_step_bic)), AIC = AIC(m_step_bic), BIC = BIC(m_step_bic),
+                   adj_R2 = summary(m_step_bic)$adj.r.squared))
+)
+kable(selection_tbl, digits = 3,
+      caption = "In-sample comparison. These numbers are optimistic by construction.")
+
+cat("Formula chosen by AIC:\n"); print(stats::formula(m_step))
+cat("\nFormula chosen by BIC:\n"); print(stats::formula(m_step_bic))
+```
+
+```{r selection-fallback, eval=!PKG$MASS}
+m_step <- m_int; m_step_bic <- m_red
+cat("MASS not installed - stepwise selection skipped.\n")
+```
+
+
+---
+
+# Part 11 --- Regularization
+
+
+## Folds respect the panel structure
+
+
+```{r group-folds}
+group_kfold <- function(groups, k = 5, seed = 2024) {
+  set.seed(seed)
+  ug   <- sample(unique(as.character(groups)))
+  map  <- stats::setNames(rep_len(seq_len(k), length(ug)), ug)
+  unname(map[as.character(groups)])
+}
+
+foldid     <- group_kfold(panel$country, k = CFG$n_folds, seed = CFG$seed)  # raw panel
+foldid_dat <- group_kfold(dat$country,   k = CFG$n_folds, seed = CFG$seed)  # imputed panel
+
+tibble(fold = foldid, country = panel$country) |>
+  group_by(fold) |>
+  summarise(countries = n_distinct(country), rows = n(), .groups = "drop") |>
+  kable(caption = "Grouped folds: every country lives in exactly one fold")
+```
+
+```{r glmnet-data}
+mm_form <- stats::reformulate(c(PRED_FULL, "status", "year_c"),
+                              response = "life_expectancy")
+X <- stats::model.matrix(mm_form, data = dat)[, -1, drop = FALSE]
+colnames(X) <- make.names(colnames(X))
+y <- dat$life_expectancy
+cat("Design matrix:", nrow(X), "x", ncol(X), "\n")
+```
+
+
+
+```{r glmnet-fit, eval=PKG$glmnet, fig.height=4.6}
+alphas <- c(0, 0.25, 0.5, 0.75, 1)
+
+cv_list <- lapply(alphas, function(a) {
+  glmnet::cv.glmnet(X, y, alpha = a, foldid = foldid_dat, standardize = TRUE)
+})
+names(cv_list) <- paste0("alpha_", alphas)
+
+alpha_tbl <- purrr::imap_dfr(cv_list, function(cv, nm) {
+  i <- which(cv$lambda == cv$lambda.min)
+  tibble(alpha = as.numeric(sub("alpha_", "", nm)),
+         lambda_min = cv$lambda.min, lambda_1se = cv$lambda.1se,
+         cv_mse = cv$cvm[i], cv_rmse = sqrt(cv$cvm[i]),
+         nonzero_at_1se = cv$nzero[which(cv$lambda == cv$lambda.1se)])
+})
+kable(alpha_tbl, digits = 4,
+      caption = "Elastic-net mixing parameter selected by grouped cross-validation")
+
+best_alpha <- alpha_tbl$alpha[which.min(alpha_tbl$cv_rmse)]
+cat("Best alpha:", best_alpha, "\n")
+
+op <- graphics::par(mfrow = c(1, 2), mar = c(4.2, 4.2, 3.4, 1))
+plot(cv_list[["alpha_0"]]); graphics::title("Ridge", line = 2.6)
+plot(cv_list[["alpha_1"]]); graphics::title("Lasso", line = 2.6)
+graphics::par(op)
+```
+
+```{r glmnet-coefs, eval=PKG$glmnet, fig.height=6.5}
+extract_coefs <- function(cv, label, s = "lambda.1se") {
+  cf <- as.matrix(stats::coef(cv, s = s))
+  tibble(term = rownames(cf), estimate = cf[, 1], model = label) |>
+    filter(term != "(Intercept)")
+}
+
+coef_cmp <- bind_rows(
+  extract_coefs(cv_list[["alpha_0"]], "Ridge"),
+  extract_coefs(cv_list[[paste0("alpha_", best_alpha)]],
+                paste0("Elastic net (a=", best_alpha, ")")),
+  extract_coefs(cv_list[["alpha_1"]], "Lasso")
+)
+
+sd_x <- apply(X, 2, stats::sd)
+coef_cmp |>
+  mutate(std_estimate = estimate * sd_x[term]) |>   # per 1 SD of the predictor
+  ggplot(aes(std_estimate, fct_reorder(term, abs(std_estimate)), fill = model)) +
+  geom_col(position = position_dodge(width = .8), width = .75) +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  scale_fill_manual(values = c("#1b6ca8", "#e07b39", "#5b8c5a")) +
+  labs(title = "Standardised coefficients under three penalties",
+       subtitle = "Effect of a one-standard-deviation change, at lambda.1se",
+       x = "Change in life expectancy (years)", y = NULL, fill = NULL)
+
+zeroed <- extract_coefs(cv_list[["alpha_1"]], "Lasso") |>
+  filter(estimate == 0) |>
+  pull(term)
+cat("Predictors eliminated by the lasso at lambda.1se:\n  ",
+    if (length(zeroed)) paste(zeroed, collapse = ", ") else "(none)", "\n")
+```
+
+---
+
+# Part 12 --- Multilevel / Mixed-Effects Models
+
+
+```{r mixed-prep, eval=PKG$lme4}
+lmer_fun <- if (PKG$lmerTest) lmerTest::lmer else lme4::lmer
+
+# z-scoring the predictors keeps the optimiser well behaved and makes fixed effects
+# comparable (one SD of the predictor -> beta years of life expectancy)
+Z_VARS <- c(PRED_REDUCED, "year_c")
+dat_z <- dat |>
+  mutate(across(all_of(Z_VARS), ~ as.numeric(scale(.x)), .names = "{.col}_z"))
+Z_TERMS <- paste0(Z_VARS, "_z")
+
+form_fixed <- paste(c(Z_TERMS, "status"), collapse = " + ")
+
+# variable used for the random slope (falls back if VIF pruning removed schooling)
+slope_var <- if ("schooling_z" %in% names(dat_z)) "schooling_z" else Z_TERMS[1]
+```
+
+## Random intercept
+
+```{r mixed-ri, eval=PKG$lme4}
+m_ri <- lmer_fun(
+  stats::as.formula(paste("life_expectancy ~", form_fixed, "+ (1 | country)")),
+  data = dat_z, REML = TRUE
+)
+
+fe <- as.data.frame(stats::coef(summary(m_ri)))
+fe$term <- rownames(fe)
+fe |>
+  as_tibble() |>
+  select(term, everything()) |>
+  arrange(dplyr::desc(abs(Estimate))) |>
+  kable(digits = 4, caption = "Random-intercept model: fixed effects (per 1 SD)")
+```
+
+```{r mixed-icc, eval=PKG$lme4}
+vc <- as.data.frame(lme4::VarCorr(m_ri))
+sig_u <- vc$vcov[vc$grp == "country"]
+sig_e <- vc$vcov[vc$grp == "Residual"]
+
+tibble(
+  component = c("Between-country variance (sigma_u^2)",
+                "Residual variance (sigma_e^2)",
+                "Intraclass correlation (ICC)"),
+  value = c(sig_u, sig_e, sig_u / (sig_u + sig_e))
+) |>
+  kable(digits = 4, caption = "Variance decomposition")
+```
+
+
+## Random slope
+
+```{r mixed-rs, eval=PKG$lme4}
+m_rs <- lmer_fun(
+  stats::as.formula(paste0("life_expectancy ~ ", form_fixed,
+                           " + (1 + ", slope_var, " | country)")),
+  data = dat_z, REML = TRUE,
+  control = lme4::lmerControl(optimizer = "bobyqa",
+                              optCtrl = list(maxfun = 2e5))
+)
+
+comp <- stats::anova(m_ri, m_rs)   # lme4 refits with ML for the LR test
+as.data.frame(comp) |>
+  tibble::rownames_to_column("model") |>
+  kable(digits = 3, caption = "Likelihood-ratio test: random intercept vs random slope")
+```
+
+### Convergence and singularity
+
+```{r mixed-singular, eval=PKG$lme4}
+conv_report <- function(m, label) {
+  msgs <- m@optinfo$conv$lme4$messages
+  tibble(model = label,
+         singular = lme4::isSingular(m, tol = 1e-4),
+         n_theta = length(lme4::getME(m, "theta")),
+         min_abs_theta = min(abs(lme4::getME(m, "theta"))),
+         convergence_messages = if (is.null(msgs)) "none" else paste(msgs, collapse = " | "))
+}
+
+bind_rows(conv_report(m_ri, "Random intercept"),
+          conv_report(m_rs, "Random intercept + slope")) |>
+  kable(caption = "Convergence diagnostics (warnings are reported, not silenced)")
+
+if (has("performance")) {
+  cat("performance::check_singularity(m_rs):",
+      performance::check_singularity(m_rs), "\n")
+}
+
+if (lme4::isSingular(m_rs, tol = 1e-4)) {
+  cat("\nThe random-slope fit is SINGULAR. The random-intercept model is retained as\n",
+      "the primary specification; the slope variance is not identified by these data.\n")
+} else {
+  cat("\nThe random-slope fit is not singular; the comparison above can be read normally.\n")
+}
+```
+
+```{r mixed-ranef, eval=PKG$lme4, fig.height=4.4}
+re <- lme4::ranef(m_ri, condVar = TRUE)$country
+re_df <- tibble(country = rownames(re), intercept = re[, 1]) |>
+  arrange(intercept) |>
+  mutate(rank = dplyr::row_number())
+
+bind_rows(head(re_df, 12), tail(re_df, 12)) |>
+  mutate(country = fct_reorder(country, intercept),
+         side = ifelse(intercept > 0, "above expectation", "below expectation")) |>
+  ggplot(aes(intercept, country, fill = side)) +
+  geom_col() +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  scale_fill_manual(values = c("above expectation" = "#1b6ca8",
+                               "below expectation" = "#c0392b")) +
+  labs(title = "Country-specific residual baseline deviations",
+       subtitle = "Estimated departure from the fixed-effects prediction, not a proven effect",
+       x = "Random intercept (years)", y = NULL, fill = NULL)
+```
+
+
+
+```{r mixed-wb, eval=PKG$lme4}
+wb_vars <- intersect(c("schooling", "income_composition", "log_gdp",
+                       "adult_mortality"), PRED_REDUCED)
+if (length(wb_vars) == 0)
+  wb_vars <- intersect(c("schooling", "income_composition"), names(dat))
+
+dat_wb <- dat |>
+  group_by(country) |>
+  mutate(across(all_of(wb_vars),
+                list(btw = ~ mean(.x), wth = ~ .x - mean(.x)),
+                .names = "{.col}_{.fn}")) |>
+  ungroup()
+
+wb_terms <- c(paste0(wb_vars, "_btw"), paste0(wb_vars, "_wth"))
+m_wb <- lmer_fun(
+  stats::as.formula(paste("life_expectancy ~", paste(wb_terms, collapse = " + "),
+                          "+ status + year_c + (1 | country)")),
+  data = dat_wb, REML = TRUE
+)
+
+fw <- as.data.frame(stats::coef(summary(m_wb)))
+fw$term <- rownames(fw)
+fw |>
+  as_tibble() |>
+  filter(grepl("_btw$|_wth$", term)) |>
+  mutate(variable = sub("_(btw|wth)$", "", term),
+         effect   = ifelse(grepl("_btw$", term), "between countries", "within country")) |>
+  select(variable, effect, Estimate, `Std. Error`) |>
+  arrange(variable, effect) |>
+  kable(digits = 4, caption = "Between-country vs within-country associations")
+```
+
+---
+
+# Part 13 --- Time Effects
+
+
+```{r time-models, eval=PKG$lme4}
+ctrl <- lme4::lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+
+m_t_lin  <- lmer_fun(life_expectancy ~ year_c + (1 | country),
+                     data = dat, REML = FALSE)
+m_t_quad <- lmer_fun(life_expectancy ~ year_c + I(year_c^2) + (1 | country),
+                     data = dat, REML = FALSE)
+m_t_rs   <- lmer_fun(life_expectancy ~ year_c + (1 + year_c | country),
+                     data = dat, REML = FALSE, control = ctrl)
+m_t_full <- lmer_fun(life_expectancy ~ year_c + I(year_c^2) + (1 + year_c | country),
+                     data = dat, REML = FALSE, control = ctrl)
+```
+
+### Pairwise nested tests only
+
+```{r time-nested, eval=PKG$lme4}
+lr_pair <- function(small, large, label) {
+  a <- stats::anova(small, large)
+  tibble(comparison = label, df_diff = a$Df[2], Chisq = a$Chisq[2],
+         p.value = a[["Pr(>Chisq)"]][2])
+}
+
+bind_rows(
+  lr_pair(m_t_lin,  m_t_quad, "linear -> quadratic time (fixed part)"),
+  lr_pair(m_t_lin,  m_t_rs,   "common slope -> country-specific slope (random part)"),
+  lr_pair(m_t_quad, m_t_full, "quadratic: common slope -> country-specific slope"),
+  lr_pair(m_t_rs,   m_t_full, "country-specific slope: linear -> quadratic time")
+) |>
+  kable(digits = 4, caption = "Each row is a genuinely nested comparison")
+```
+
+### Non-nested comparison by information criterion
+
+```{r time-ic, eval=PKG$lme4}
+ic_row <- function(m, label) tibble(model = label, df = attr(stats::logLik(m), "df"),
+                                    logLik = as.numeric(stats::logLik(m)),
+                                    AIC = stats::AIC(m), BIC = stats::BIC(m),
+                                    singular = lme4::isSingular(m, tol = 1e-4))
+bind_rows(
+  ic_row(m_t_lin,  "year + (1|country)"),
+  ic_row(m_t_quad, "year + year^2 + (1|country)"),
+  ic_row(m_t_rs,   "year + (1 + year|country)"),
+  ic_row(m_t_full, "year + year^2 + (1 + year|country)")
+) |>
+  arrange(AIC) |>
+  kable(digits = 2,
+        caption = "AIC/BIC comparison, which does not require nesting (singular fits flagged)")
+```
+
+```{r time-slopes, eval=PKG$lme4, fig.height=4.2}
+sl <- lme4::ranef(m_t_rs)$country
+slopes <- tibble(country = rownames(sl),
+                 slope = sl[["year_c"]] + lme4::fixef(m_t_rs)[["year_c"]])
+
+ggplot(slopes, aes(slope)) +
+  geom_histogram(bins = 40, fill = "#1b6ca8", colour = "white") +
+  geom_vline(xintercept = lme4::fixef(m_t_rs)[["year_c"]], linetype = 2,
+             colour = "#c0392b", linewidth = .9) +
+  labs(title = "Countries improve at very different rates",
+       subtitle = "Dashed line: the average (fixed-effect) annual improvement",
+       x = "Estimated annual change in life expectancy (years/year)", y = "Countries")
+
+bind_rows(
+  slopes |> arrange(desc(slope)) |> head(6) |> mutate(group = "fastest improvement"),
+  slopes |> arrange(slope) |> head(6) |> mutate(group = "slowest / declining")
+) |>
+  kable(digits = 3, caption = "Extremes of the country-specific time trend")
+```
+
+```{r time-quad, eval=PKG$lme4}
+tibble(term = names(lme4::fixef(m_t_quad)),
+       estimate = unname(lme4::fixef(m_t_quad))) |>
+  kable(digits = 4, caption = "Quadratic time trend (global improvement, decelerating)")
+```
+
+---
+
+# Part 14 --- Machine Learning Models
+
+```{r ml-grids}
+RF_GRID <- tidyr::expand_grid(
+  mtry_frac = c(1/3, 1/2),
+  min_node  = c(5, 20)
+)
+
+XGB_GRID <- tidyr::expand_grid(
+  max_depth        = c(3, 5, 7),
+  eta              = 0.05,
+  min_child_weight = 3
+)
+
+XGB_FIXED <- list(objective = "reg:squarederror", subsample = 0.8,
+                  colsample_bytree = 0.8)
+
+# defaults used when CFG$tune_ml is FALSE
+RF_DEFAULT  <- list(mtry_frac = 1/3, min_node = 5)
+XGB_DEFAULT <- list(params = c(XGB_FIXED, list(eta = 0.05, max_depth = 5,
+                                               min_child_weight = 3)),
+                    nrounds = 600)
+
+kable(RF_GRID, caption = "Random-forest tuning grid (inner CV)")
+kable(XGB_GRID, caption = "XGBoost tuning grid (inner CV; nrounds by early stopping)")
+```
+
+```{r ml-tuners}
+tune_rf <- function(tr, Xtr, ytr, inner_k = 3) {
+  if (!CFG$tune_ml) return(RF_DEFAULT)
+  fid <- group_kfold(tr$country, k = inner_k, seed = CFG$seed + 7)
+  scores <- vapply(seq_len(nrow(RF_GRID)), function(g) {
+    mtry <- max(1, floor(ncol(Xtr) * RF_GRID$mtry_frac[g]))
+    mean(vapply(sort(unique(fid)), function(f) {
+      i1 <- fid != f; i2 <- fid == f
+      fit <- ranger::ranger(x = as.data.frame(Xtr[i1, , drop = FALSE]), y = ytr[i1],
+                            num.trees = 300, mtry = mtry,
+                            min.node.size = RF_GRID$min_node[g],
+                            seed = CFG$seed, num.threads = 2)
+      rmse(ytr[i2], stats::predict(fit, data = as.data.frame(Xtr[i2, , drop = FALSE]))$predictions)
+    }, numeric(1)))
+  }, numeric(1))
+  as.list(RF_GRID[which.min(scores), ])
+}
+
+tune_xgb <- function(tr, Xtr, ytr, inner_k = 3) {
+  if (!CFG$tune_ml) return(XGB_DEFAULT)
+  fid   <- group_kfold(tr$country, k = inner_k, seed = CFG$seed + 7)
+  folds <- split(seq_along(fid), fid)
+  dtrain <- xgboost::xgb.DMatrix(data = as.matrix(Xtr), label = ytr)
+
+  res <- lapply(seq_len(nrow(XGB_GRID)), function(g) {
+    prm <- c(XGB_FIXED, list(eta = XGB_GRID$eta[g], max_depth = XGB_GRID$max_depth[g],
+                             min_child_weight = XGB_GRID$min_child_weight[g]))
+    cv <- xgboost::xgb.cv(params = prm, data = dtrain, nrounds = 1200, folds = folds,
+                          early_stopping_rounds = 30, verbose = 0, nthread = 2)
+    log_col <- grep("test.*rmse.*mean", names(cv$evaluation_log), value = TRUE)[1]
+    list(params = prm, nrounds = cv$best_iteration,
+         score = cv$evaluation_log[[log_col]][cv$best_iteration])
+  })
+  res[[which.min(vapply(res, function(z) z$score, numeric(1)))]]
+}
+```
+
+---
+
+# Part 15 --- Validation Strategy
+
+## The pipeline, and why the order matters
+
+
+```{r preprocess-fold}
+finalize <- function(tr, te) {
+  # backstop: a variable that was entirely missing in the training fold has no median.
+  med <- vapply(tr[IMPUTE_VARS], function(z) stats::median(z, na.rm = TRUE), numeric(1))
+  med[!is.finite(med)] <- 0
+  for (v in IMPUTE_VARS) {
+    tr[[v]][is.na(tr[[v]])] <- med[[v]]
+    te[[v]][is.na(te[[v]])] <- med[[v]]
+  }
+  relog <- function(d) d |>
+    mutate(log_gdp = log1p_safe(gdp), log_population = log1p_safe(population),
+           log_measles = log1p_safe(measles), log_hiv = log1p_safe(hiv_aids))
+  list(tr = relog(tr), te = relog(te))
+}
+
+build_matrix <- function(tr, te) {
+  Xtr <- stats::model.matrix(mm_form, data = tr)[, -1, drop = FALSE]
+  Xte <- stats::model.matrix(mm_form, data = te)[, -1, drop = FALSE]
+  add <- setdiff(colnames(Xtr), colnames(Xte))
+  if (length(add)) {
+    pad <- matrix(0, nrow(Xte), length(add), dimnames = list(NULL, add))
+    Xte <- cbind(Xte, pad)
+  }
+  Xte <- Xte[, colnames(Xtr), drop = FALSE]
+  colnames(Xtr) <- make.names(colnames(Xtr))
+  colnames(Xte) <- colnames(Xtr)
+  list(Xtr = Xtr, Xte = Xte)
+}
+
+# THE fold preprocessor: everything it knows, it learned from train_raw.
+preprocess_fold <- function(train_raw, test_raw, test_mode = "interior") {
+  prm <- impute_fit(train_raw, IMPUTE_VARS)
+  tr  <- impute_apply(train_raw, prm, mode = "interior")
+  te  <- impute_apply(test_raw, prm,
+                      history = if (test_mode == "causal") train_raw else NULL,
+                      mode    = test_mode)
+  f <- finalize(tr, te)
+  M <- build_matrix(f$tr, f$te)
+  list(tr = f$tr, te = f$te, Xtr = M$Xtr, Xte = M$Xte,
+       ytr = f$tr$life_expectancy, yte = f$te$life_expectancy)
+}
+```
+
+
+```{r cv-engine}
+run_cv <- function(folds, specs, data = panel, test_mode = "interior") {
+  out <- list()
+  for (f in sort(unique(folds))) {
+    itr <- which(folds != f); ite <- which(folds == f)
+    P <- preprocess_fold(data[itr, ], data[ite, ],
+                         test_mode = if (CFG$test_interpolate) test_mode else "causal")
+    for (nm in names(specs)) {
+      pred <- tryCatch(specs[[nm]](P),
+        error = function(e) { warning(nm, " failed on fold ", f, ": ",
+                                      conditionMessage(e)); rep(NA_real_, length(ite)) })
+      out[[length(out) + 1]] <- tibble(model = nm, fold = f,
+                                       obs = P$yte, pred = as.numeric(pred))
+    }
+  }
+  bind_rows(out)
+}
+
+summarise_cv <- function(preds) {
+  per_fold <- preds |>
+    group_by(model, fold) |>
+    summarise(RMSE = rmse(obs, pred), MAE = mae(obs, pred), R2 = r2(obs, pred),
+              .groups = "drop")
+  fold_avg <- per_fold |>
+    group_by(model) |>
+    summarise(RMSE_foldmean = mean(RMSE), RMSE_sd = stats::sd(RMSE),
+              MAE_foldmean = mean(MAE), R2_foldmean = mean(R2), .groups = "drop")
+  # pooled out-of-fold metrics: every observation predicted exactly once
+  pooled <- preds |>
+    group_by(model) |>
+    summarise(RMSE_oof = rmse(obs, pred), MAE_oof = mae(obs, pred),
+              R2_oof = r2(obs, pred), .groups = "drop")
+  left_join(pooled, fold_avg, by = "model") |> arrange(RMSE_oof)
+}
+```
+
+```{r cv-specs}
+scale_train <- function(Xtr, Xte) {
+  mu <- colMeans(Xtr); sdv <- apply(Xtr, 2, stats::sd); sdv[sdv == 0] <- 1
+  list(tr = sweep(sweep(Xtr, 2, mu, "-"), 2, sdv, "/"),
+       te = sweep(sweep(Xte, 2, mu, "-"), 2, sdv, "/"))
+}
+
+make_specs <- function(use_random_effects = FALSE) {
+  s <- list(
+    "Simple regression" = function(P)
+      stats::predict(lm(life_expectancy ~ schooling, data = P$tr), newdata = P$te),
+
+    "Multiple regression" = function(P)
+      stats::predict(lm(form_red, data = P$tr), newdata = P$te),
+
+    "MLR + interactions" = function(P)
+      stats::predict(lm(form_int, data = P$tr), newdata = P$te)
+  )
+
+  if (PKG$lme4) {
+    s[["Mixed effects (RI)"]] <- function(P) {
+      sc  <- scale_train(P$Xtr, P$Xte)
+      dtr <- as.data.frame(sc$tr); dtr$life_expectancy <- P$ytr; dtr$country <- P$tr$country
+      dte <- as.data.frame(sc$te); dte$country <- P$te$country
+      fml <- stats::as.formula(paste("life_expectancy ~",
+                                     paste(colnames(sc$tr), collapse = " + "),
+                                     "+ (1 | country)"))
+      m <- suppressWarnings(suppressMessages(
+        lme4::lmer(fml, data = dtr, REML = TRUE,
+                   control = lme4::lmerControl(optimizer = "bobyqa",
+                                               optCtrl = list(maxfun = 2e5)))))
+      stats::predict(m, newdata = dte, allow.new.levels = TRUE,
+                     re.form = if (use_random_effects) NULL else NA)
+    }
+  }
+
+  if (PKG$glmnet) {
+    penalised <- function(alpha) function(P) {
+      inner <- group_kfold(P$tr$country, k = 5, seed = CFG$seed + 1)
+      cv <- glmnet::cv.glmnet(P$Xtr, P$ytr, alpha = alpha, foldid = inner,
+                              standardize = TRUE)
+      as.numeric(stats::predict(cv, newx = P$Xte, s = "lambda.min"))
+    }
+    s[["Ridge"]]       <- penalised(0)
+    s[["Lasso"]]       <- penalised(1)
+    s[["Elastic net"]] <- penalised(0.5)
+  }
+
+  if (PKG$ranger) {
+    s[["Random forest"]] <- function(P) {
+      hp  <- tune_rf(P$tr, P$Xtr, P$ytr)
+      fit <- ranger::ranger(x = as.data.frame(P$Xtr), y = P$ytr,
+                            num.trees = CFG$rf_trees,
+                            mtry = max(1, floor(ncol(P$Xtr) * hp$mtry_frac)),
+                            min.node.size = hp$min_node,
+                            seed = CFG$seed, num.threads = 2)
+      stats::predict(fit, data = as.data.frame(P$Xte))$predictions
+    }
+  }
+
+  if (PKG$xgboost && CFG$run_xgboost) {
+    s[["XGBoost"]] <- function(P) {
+      hp  <- tune_xgb(P$tr, P$Xtr, P$ytr)
+      bst <- xgboost::xgb.train(params = hp$params,
+                                data = xgboost::xgb.DMatrix(as.matrix(P$Xtr), label = P$ytr),
+                                nrounds = hp$nrounds, verbose = 0, nthread = 2)
+      stats::predict(bst, as.matrix(P$Xte))
+    }
+  }
+  s
+}
+
+specs_grouped <- make_specs(use_random_effects = FALSE)
+names(specs_grouped)
+```
+
+## Evaluation A --- grouped cross-validation over countries
+
+```{r cv-grouped, cache=TRUE}
+cv_preds   <- run_cv(foldid, specs_grouped, data = panel, test_mode = "interior")
+cv_summary <- summarise_cv(cv_preds)
+kable(cv_summary, digits = 3,
+      caption = "Grouped CV: every test country is unseen, and its preprocessing was never fitted on it")
+```
+
+
+
+```{r cv-grouped-plot, fig.height=4.6}
+cv_preds |>
+  group_by(model, fold) |>
+  summarise(RMSE = rmse(obs, pred), .groups = "drop") |>
+  mutate(model = fct_reorder(model, RMSE)) |>
+  ggplot(aes(RMSE, model)) +
+  geom_boxplot(fill = "#1b6ca8", alpha = .3, outlier.shape = NA) +
+  geom_jitter(height = .12, alpha = .8, colour = "#1b6ca8") +
+  labs(title = "Fold-to-fold variability, grouped CV",
+       subtitle = "One point per fold; spread matters as much as the mean",
+       x = "RMSE (years)", y = NULL)
+```
+
+## Evaluation B --- temporal split
+
+```{r cv-temporal, cache=TRUE}
+train_idx <- which(panel$year <= CFG$temporal_cutoff)
+test_idx  <- which(panel$year >  CFG$temporal_cutoff)
+
+cat("Train:", length(train_idx), "rows (<=", CFG$temporal_cutoff, ") | Test:",
+    length(test_idx), "rows (>", CFG$temporal_cutoff, ")\n")
+
+# causal mode: the test transform never looks forward in time
+P_temp <- preprocess_fold(panel[train_idx, ], panel[test_idx, ], test_mode = "causal")
+
+# here the test countries HAVE been seen, so the random effects are usable
+specs_temporal <- make_specs(use_random_effects = TRUE)
+
+temporal_preds <- purrr::imap_dfr(specs_temporal, function(fn, nm) {
+  pred <- tryCatch(fn(P_temp),
+    error = function(e) { warning(nm, ": ", conditionMessage(e))
+                          rep(NA_real_, length(test_idx)) })
+  tibble(model = nm, obs = P_temp$yte, pred = as.numeric(pred))
+})
+
+temporal_summary <- temporal_preds |>
+  group_by(model) |>
+  summarise(RMSE = rmse(obs, pred), MAE = mae(obs, pred), R2 = r2(obs, pred),
+            .groups = "drop") |>
+  arrange(RMSE)
+kable(temporal_summary, digits = 3,
+      caption = "Temporal validation: train on 2000-2012, predict 2013-2015 (causal preprocessing)")
+```
+
+
+```{r cv-naive, cache=TRUE}
+naive_folds <- sample(rep_len(seq_len(CFG$n_folds), nrow(panel)))
+naive_specs <- specs_grouped[intersect(c("Multiple regression", "Random forest"),
+                                       names(specs_grouped))]
+naive_summary <- summarise_cv(run_cv(naive_folds, naive_specs, data = panel))
+
+naive_cmp <- bind_rows(
+  naive_summary |> mutate(scheme = "Random row split (WRONG)"),
+  cv_summary |> filter(model %in% naive_summary$model) |>
+    mutate(scheme = "Grouped by country (correct)")
+) |>
+  select(scheme, model, RMSE_oof, MAE_oof, R2_oof) |>
+  arrange(model, scheme)
+
+kable(naive_cmp, digits = 3,
+      caption = "The optimism produced by ignoring the panel structure")
+
+naive_gap <- naive_cmp |>
+  group_by(model) |>
+  summarise(gap = RMSE_oof[scheme == "Grouped by country (correct)"] -
+                  RMSE_oof[scheme == "Random row split (WRONG)"], .groups = "drop")
+```
+
+---
+
+# Part 16 --- Model Comparison
+
+```{r comparison}
+interpretability <- tibble(
+  model = c("Simple regression", "Multiple regression", "MLR + interactions",
+            "Mixed effects (RI)", "Ridge", "Lasso", "Elastic net",
+            "Random forest", "XGBoost"),
+  interpretability = c("Very high", "High", "High", "High", "Medium",
+                       "Medium-high", "Medium", "Medium", "Medium"),
+  handles_panel = c("No", "No", "No", "Yes", "No", "No", "No", "No", "No"),
+  valid_inference = c("Only with clustered SEs", "Only with clustered SEs",
+                      "Only with clustered SEs", "Yes", "Limited", "Limited",
+                      "Limited", "No", "No")
+)
+
+final_table <- cv_summary |>
+  select(model, cv_RMSE = RMSE_oof, cv_MAE = MAE_oof, cv_R2 = R2_oof,
+         cv_RMSE_sd = RMSE_sd) |>
+  left_join(temporal_summary |>
+              select(model, temporal_RMSE = RMSE, temporal_MAE = MAE,
+                     temporal_R2 = R2), by = "model") |>
+  left_join(interpretability, by = "model") |>
+  arrange(cv_RMSE)
+
+kable(final_table, digits = 3,
+      caption = "Central comparison table: pooled out-of-fold metrics, temporal metrics, interpretability")
+```
+
+```{r comparison-dynamic}
+best_grouped  <- final_table |> slice_min(cv_RMSE, n = 1, with_ties = FALSE) |> pull(model)
+best_temporal <- temporal_summary |> slice_min(RMSE, n = 1, with_ties = FALSE) |> pull(model)
+best_linear   <- final_table |>
+  filter(model %in% c("Multiple regression", "MLR + interactions", "Ridge",
+                      "Lasso", "Elastic net")) |>
+  slice_min(cv_RMSE, n = 1, with_ties = FALSE) |> pull(model)
+tree_models   <- c("Random forest", "XGBoost")
+trees_lead    <- best_grouped %in% tree_models
+same_winner   <- identical(best_grouped, best_temporal)
+```
+
+
+```{r comparison-plot, fig.height=4.6}
+final_table |>
+  select(model, `Grouped CV` = cv_RMSE, `Temporal` = temporal_RMSE) |>
+  pivot_longer(-model, names_to = "scheme", values_to = "RMSE") |>
+  filter(!is.na(RMSE)) |>
+  mutate(model = fct_reorder(model, RMSE)) |>
+  ggplot(aes(RMSE, model, fill = scheme)) +
+  geom_col(position = position_dodge(width = .8), width = .72) +
+  scale_fill_manual(values = c("Grouped CV" = "#1b6ca8", "Temporal" = "#e07b39")) +
+  labs(title = "Out-of-sample error under both validation schemes",
+       subtitle = "Pooled out-of-fold RMSE (grouped) and hold-out RMSE (temporal)",
+       x = "RMSE (years)", y = NULL, fill = NULL)
+```
+
+```{r comparison-residuals, fig.height=4.6}
+cv_preds |>
+  filter(model %in% unique(c("Multiple regression", best_grouped))) |>
+  ggplot(aes(pred, obs)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey40", linetype = 2) +
+  geom_point(alpha = .2, size = .8, colour = "#1b6ca8") +
+  facet_wrap(~ model) +
+  labs(title = "Predicted vs observed on held-out countries",
+       x = "Predicted life expectancy", y = "Observed life expectancy")
+```
+
+---
+
+# Part 17 --- Interpretability
+
+```{r interp-holdout}
+h_tr <- which(foldid != 1); h_te <- which(foldid == 1)
+P1   <- preprocess_fold(panel[h_tr, ], panel[h_te, ], test_mode = "interior")
+
+cat("Holdout: fold 1 -", length(h_te), "rows,",
+    n_distinct(panel$country[h_te]), "countries\n")
+```
+
+## Permutation importance
+
+A predictor's importance is the *increase in holdout RMSE* when its values are shuffled,
+which breaks its relationship with the outcome while preserving its marginal distribution.
+
+```{r interp-perm, eval=PKG$ranger, fig.height=6}
+hp_rf  <- tune_rf(P1$tr, P1$Xtr, P1$ytr)
+rf_fit <- ranger::ranger(x = as.data.frame(P1$Xtr), y = P1$ytr,
+                         num.trees = CFG$rf_trees,
+                         mtry = max(1, floor(ncol(P1$Xtr) * hp_rf$mtry_frac)),
+                         min.node.size = hp_rf$min_node,
+                         importance = "permutation", seed = CFG$seed, num.threads = 2)
+
+rf_pred_fun <- function(newX)
+  stats::predict(rf_fit, data = as.data.frame(newX))$predictions
+
+cat("Holdout RMSE:", round(rmse(P1$yte, rf_pred_fun(P1$Xte)), 3), "years\n")
+
+perm_importance <- function(pred_fun, Xte, yte, n_rep = 5, seed = CFG$seed) {
+  set.seed(seed)
+  base <- rmse(yte, pred_fun(Xte))
+  vals <- vapply(colnames(Xte), function(v) {
+    mean(replicate(n_rep, {
+      Xp <- Xte; Xp[, v] <- sample(Xp[, v]); rmse(yte, pred_fun(Xp))
+    }))
+  }, numeric(1))
+  tibble(variable = colnames(Xte), baseline_rmse = base,
+         permuted_rmse = as.numeric(vals), increase = as.numeric(vals) - base) |>
+    arrange(desc(increase))
+}
+
+perm_imp <- perm_importance(rf_pred_fun, P1$Xte, P1$yte)
+kable(head(perm_imp, 12), digits = 4,
+      caption = "Permutation importance on held-out countries (random forest)")
+
+perm_imp |>
+  mutate(variable = fct_reorder(variable, increase)) |>
+  ggplot(aes(increase, variable)) +
+  geom_col(fill = "#1b6ca8", alpha = .9) +
+  labs(title = "Which predictors actually carry the prediction?",
+       subtitle = "Increase in holdout RMSE when the predictor is shuffled",
+       x = "RMSE increase (years)", y = NULL)
+```
+
+## Partial dependence
+
+```{r interp-pdp, eval=PKG$ranger, fig.height=5}
+partial_dep <- function(pred_fun, Xref, var, grid_n = 25, n_sample = 400) {
+  set.seed(CFG$seed)
+  idx <- sample(nrow(Xref), min(n_sample, nrow(Xref)))
+  Xs  <- Xref[idx, , drop = FALSE]
+  gr  <- stats::quantile(Xref[, var], probs = seq(.02, .98, length.out = grid_n),
+                         names = FALSE)
+  purrr::map_dfr(gr, function(v) {
+    Xt <- Xs; Xt[, var] <- v
+    tibble(variable = var, x = v, yhat = mean(pred_fun(Xt)))
+  })
+}
+
+top_vars <- head(perm_imp$variable, 4)
+pdp_df   <- purrr::map_dfr(top_vars, ~ partial_dep(rf_pred_fun, P1$Xtr, .x))
+
+ggplot(pdp_df, aes(x, yhat)) +
+  geom_line(colour = "#1b6ca8", linewidth = 1.1) +
+  facet_wrap(~ variable, scales = "free_x") +
+  labs(title = "Partial dependence for the four strongest predictors",
+       subtitle = "Average model prediction as one predictor is varied, others held as observed",
+       x = NULL, y = "Predicted life expectancy (years)")
+```
+
+
+## SHAP values (exact, for the boosted trees)
+
+```{r interp-shap, eval=PKG$xgboost && CFG$run_xgboost, fig.height=5.5}
+hp_x <- tune_xgb(P1$tr, P1$Xtr, P1$ytr)
+bst  <- xgboost::xgb.train(params = hp_x$params,
+                           data = xgboost::xgb.DMatrix(as.matrix(P1$Xtr), label = P1$ytr),
+                           nrounds = hp_x$nrounds, verbose = 0, nthread = 2)
+
+shap <- stats::predict(bst, as.matrix(P1$Xte), predcontrib = TRUE)
+colnames(shap) <- c(colnames(P1$Xtr), "BIAS")
+shap_feat <- shap[, colnames(P1$Xtr), drop = FALSE]
+
+shap_imp <- tibble(variable = colnames(shap_feat),
+                   mean_abs_shap = colMeans(abs(shap_feat))) |>
+  arrange(desc(mean_abs_shap))
+
+kable(head(shap_imp, 12), digits = 4,
+      caption = "Mean |SHAP| on held-out countries (XGBoost)")
+
+shap_imp |>
+  mutate(variable = fct_reorder(variable, mean_abs_shap)) |>
+  ggplot(aes(mean_abs_shap, variable)) +
+  geom_col(fill = "#5b8c5a", alpha = .9) +
+  labs(title = "Average contribution of each predictor to individual predictions",
+       x = "Mean |SHAP| (years)", y = NULL)
+```
+
+```{r interp-shap-dep, eval=PKG$xgboost && CFG$run_xgboost, fig.height=4.2}
+v1 <- shap_imp$variable[1]
+tibble(value = P1$Xte[, v1], shap = shap_feat[, v1],
+       status = P1$te$status) |>
+  ggplot(aes(value, shap, colour = status)) +
+  geom_hline(yintercept = 0, colour = "grey45") +
+  geom_point(alpha = .45, size = 1) +
+  geom_smooth(se = FALSE, colour = "black", linewidth = .7) +
+  scale_colour_manual(values = pal_status) +
+  labs(title = paste("SHAP dependence:", v1),
+       subtitle = "Contribution of this predictor to each individual prediction",
+       x = v1, y = "SHAP value (years)", colour = NULL)
+```
+
+
+```{r interp-agree, eval=PKG$ranger}
+rank_tbl <- perm_imp |> transmute(variable, rf_rank = dplyr::row_number())
+
+if (exists("shap_imp")) {
+  rank_tbl <- rank_tbl |>
+    left_join(shap_imp |> transmute(variable, xgb_rank = dplyr::row_number()),
+              by = "variable")
+}
+
+if (PKG$glmnet && exists("cv_list") && exists("sd_x")) {
+  lin_rank <- extract_coefs(cv_list[["alpha_1"]], "Lasso") |>
+    mutate(term = make.names(term),
+           std_abs = abs(estimate * sd_x[match(term, names(sd_x))])) |>
+    filter(!is.na(std_abs)) |>
+    arrange(desc(std_abs)) |>
+    transmute(variable = term, lasso_rank = dplyr::row_number())
+  rank_tbl <- rank_tbl |> left_join(lin_rank, by = "variable")
+}
+
+head(rank_tbl, 12) |>
+  kable(caption = "Importance rank under the definitions available in this run")
+```
+
+---
+
+# Part 18 --- Statistical vs Predictive Conclusions
+
+```{r conclusions-table}
+tibble(
+  question = c("Statistical / inferential", "Predictive"),
+  asks = c("Which variables are associated with life expectancy, and by how much?",
+           "Which model best predicts observations it has never seen?"),
+  best_tool = c("Mixed-effects model (random intercept per country)",
+                paste("Grouped CV:", best_grouped, "| Temporal:", best_temporal)),
+  why = c("Correct standard errors under repeated measures; separates within- from between-country effects",
+          "Lowest out-of-fold error; captures non-linearity without specifying it")
+) |>
+  kable(caption = "Two questions, two winners")
+```
+
+---
+
+# Part 19 --- Secondary Classification Analysis
+
+```{r clf-setup, eval=PKG$MASS}
+FIXED_CUTS <- c(65, 75)   # substantive alternative; set USE_FIXED_CUTS <- TRUE to apply
+USE_FIXED_CUTS <- FALSE
+
+to_class <- function(y, cuts)
+  cut(y, breaks = c(-Inf, cuts, Inf), labels = c("Low", "Medium", "High"))
+
+CLF_VARS <- PRED_REDUCED
+
+macro_f1 <- function(obs, pred) {
+  lv <- levels(obs)
+  mean(vapply(lv, function(l) {
+    tp <- sum(pred == l & obs == l); fp <- sum(pred == l & obs != l)
+    fn <- sum(pred != l & obs == l)
+    if (tp == 0) return(0)
+    p <- tp / (tp + fp); r <- tp / (tp + fn); 2 * p * r / (p + r)
+  }, numeric(1)))
+}
+
+clf_specs <- list()
+if (PKG$nnet) {
+  clf_specs[["Multinomial logistic"]] <- function(tr_x, tr_y, te_x) {
+    d <- as.data.frame(tr_x); d$.y <- tr_y
+    m <- nnet::multinom(.y ~ ., data = d, trace = FALSE, maxit = 400)
+    stats::predict(m, newdata = as.data.frame(te_x))
+  }
+}
+clf_specs[["LDA"]] <- function(tr_x, tr_y, te_x) {
+  stats::predict(MASS::lda(x = tr_x, grouping = tr_y), te_x)$class
+}
+clf_specs[["QDA"]] <- function(tr_x, tr_y, te_x) {
+  stats::predict(MASS::qda(x = tr_x, grouping = tr_y), te_x)$class
+}
+if (PKG$class) {
+  clf_specs[["KNN (k=15)"]] <- function(tr_x, tr_y, te_x)
+    class::knn(train = tr_x, test = te_x, cl = tr_y, k = 15)
+}
+```
+
+```{r clf-cv, eval=PKG$MASS, cache=TRUE}
+clf_results <- purrr::map_dfr(sort(unique(foldid)), function(f) {
+  itr <- which(foldid != f); ite <- which(foldid == f)
+  P <- preprocess_fold(panel[itr, ], panel[ite, ], test_mode = "interior")
+
+  # cut-points learned on the TRAINING outcomes only
+  cuts <- if (USE_FIXED_CUTS) FIXED_CUTS else
+    unname(stats::quantile(P$ytr, probs = c(1/3, 2/3)))
+  ytr_c <- to_class(P$ytr, cuts)
+  yte_c <- to_class(P$yte, cuts)
+
+  Xtr <- as.matrix(P$tr[, CLF_VARS]); Xte <- as.matrix(P$te[, CLF_VARS])
+  mu <- colMeans(Xtr); sdv <- apply(Xtr, 2, stats::sd); sdv[sdv == 0] <- 1
+  ztr <- sweep(sweep(Xtr, 2, mu, "-"), 2, sdv, "/")
+  zte <- sweep(sweep(Xte, 2, mu, "-"), 2, sdv, "/")
+
+  purrr::imap_dfr(clf_specs, function(fn, nm) {
+    pr <- tryCatch(fn(ztr, ytr_c, zte),
+                   error = function(e) { warning(nm, " fold ", f, ": ",
+                                                 conditionMessage(e)); NULL })
+    if (is.null(pr)) return(tibble())
+    pr <- factor(pr, levels = levels(ytr_c))
+    tibble(model = nm, fold = f,
+           lower_cut = cuts[1], upper_cut = cuts[2],
+           accuracy = mean(pr == yte_c),
+           macro_f1 = macro_f1(yte_c, pr),
+           adjacent_error = mean(abs(as.integer(pr) - as.integer(yte_c)) == 1),
+           far_error = mean(abs(as.integer(pr) - as.integer(yte_c)) == 2))
+  })
+})
+
+clf_results |>
+  group_by(model) |>
+  summarise(accuracy = mean(accuracy), accuracy_sd = stats::sd(accuracy),
+            macro_f1 = mean(macro_f1),
+            adjacent_error = mean(adjacent_error), far_error = mean(far_error),
+            .groups = "drop") |>
+  arrange(desc(accuracy)) |>
+  kable(digits = 3,
+        caption = "Grouped CV with fold-wise cut-points (no label leakage)")
+
+cat(sprintf("Fold-wise lower cut-points: %s\nFold-wise upper cut-points: %s\n",
+            paste(round(unique(clf_results$lower_cut), 1), collapse = ", "),
+            paste(round(unique(clf_results$upper_cut), 1), collapse = ", ")))
+```
+
+```{r clf-verdict}
+err_split <- if (exists("clf_results") && nrow(clf_results) > 0) {
+  clf_results |> summarise(adjacent = mean(adjacent_error), far = mean(far_error))
+} else tibble(adjacent = NA_real_, far = NA_real_)
+```
+---
+
+# Part 20 --- Robustness and Sensitivity Analysis
+
+## Sensitivity 1 --- imputation strategy
+
+```{r sens-imputation}
+m_red_cc  <- lm(form_red, data = dat_cc)
+m_red_imp <- lm(form_red, data = dat_imp)
+
+sens_imp <- bind_rows(
+  tidy_fit(m_red_cc,  conf = FALSE) |> mutate(dataset = "Complete cases"),
+  tidy_fit(m_red_imp, conf = FALSE) |> mutate(dataset = "Panel-aware imputation")
+)
+
+sens_wide <- sens_imp |>
+  select(term, dataset, estimate) |>
+  pivot_wider(names_from = dataset, values_from = estimate) |>
+  mutate(difference = `Panel-aware imputation` - `Complete cases`,
+         rel_change_pct = 100 * difference / abs(`Complete cases`),
+         sign_flip = sign(`Panel-aware imputation`) != sign(`Complete cases`))
+
+sens_wide |> arrange(desc(abs(rel_change_pct))) |>
+  kable(digits = 4, caption = "Coefficient stability across missing-data strategies")
+
+cat(sprintf("Coefficients that change sign between the two strategies: %d of %d\n",
+            sum(sens_wide$sign_flip, na.rm = TRUE), nrow(sens_wide)))
+```
+
+```{r sens-imputation-plot, fig.height=5.5}
+sens_imp |>
+  filter(term != "(Intercept)") |>
+  ggplot(aes(estimate, fct_reorder(term, estimate), colour = dataset)) +
+  geom_vline(xintercept = 0, colour = "grey45", linetype = 2) +
+  geom_point(size = 2.4, position = position_dodge(width = .5)) +
+  scale_colour_manual(values = c("Complete cases" = "#c0392b",
+                                 "Panel-aware imputation" = "#1b6ca8")) +
+  labs(title = "Do the conclusions depend on how missing values were handled?",
+       x = "Coefficient", y = NULL, colour = NULL)
+```
+
+## Sensitivity 2 --- multiple imputation with Rubin's rules
+
+```{r sens-mice, eval=PKG$mice && CFG$run_mice, cache=TRUE}
+mice_vars <- c("life_expectancy", IMPUTE_VARS, "status", "year_c")
+mice_df   <- as.data.frame(life[, intersect(mice_vars, names(life))])
+
+imp_obj <- mice::mice(mice_df, m = CFG$mice_m, maxit = CFG$mice_maxit,
+                      method = "pmm", seed = CFG$seed, printFlag = FALSE)
+
+fits <- lapply(seq_len(CFG$mice_m), function(i) {
+  di <- mice::complete(imp_obj, i) |>
+    mutate(log_gdp = log1p_safe(gdp), log_population = log1p_safe(population),
+           log_measles = log1p_safe(measles), log_hiv = log1p_safe(hiv_aids))
+  lm(form_red, data = di)
+})
+
+pool_rubin <- function(fits) {
+  m   <- length(fits)
+  cs  <- lapply(fits, function(f) summary(f)$coefficients)
+  tms <- rownames(cs[[1]])
+  Q <- vapply(cs, function(e) e[tms, 1], numeric(length(tms)))
+  U <- vapply(cs, function(e) e[tms, 2]^2, numeric(length(tms)))
+  Qbar <- rowMeans(Q); Ubar <- rowMeans(U)
+  B  <- apply(Q, 1, stats::var)
+  Tv <- Ubar + (1 + 1 / m) * B
+  se <- sqrt(Tv)
+  lambda <- (1 + 1 / m) * B / Tv                  # fraction of missing information
+  df <- ifelse(lambda > 0, (m - 1) / lambda^2, Inf)
+  tibble(term = tms, estimate = Qbar, std.error = se,
+         statistic = Qbar / se,
+         p.value = 2 * stats::pt(-abs(Qbar / se), df),
+         fmi = lambda)
+}
+
+pooled <- pool_rubin(fits)
+
+pooled |>
+  left_join(tidy_fit(m_red_imp, conf = FALSE) |>
+              select(term, single_estimate = estimate, single_se = std.error),
+            by = "term") |>
+  mutate(se_inflation = std.error / single_se) |>
+  select(term, estimate, single_estimate, std.error, single_se, se_inflation, fmi, p.value) |>
+  arrange(desc(fmi)) |>
+  kable(digits = 4,
+        caption = "Pooled multiple-imputation estimates vs single imputation")
+```
+
+
+
+```{r sens-mice-2l, eval=FALSE}
+# Research-quality version: country enters the imputation model as a cluster.
+pred <- mice::make.predictorMatrix(mice_df2)          # mice_df2 includes a country id
+pred[, "country_id"] <- -2                            # -2 marks the class variable
+meth <- mice::make.method(mice_df2)
+meth[IMPUTE_VARS] <- "2l.pmm"                         # or "2l.norm" / "2l.lmer"
+imp2l <- mice::mice(mice_df2, method = meth, predictorMatrix = pred,
+                    m = 5, maxit = 10, seed = CFG$seed)
+```
+
+## Sensitivity 3 --- influential observations
+
+```{r sens-influence}
+cook_cut  <- 4 / nrow(dat)
+keep_rows <- which(stats::cooks.distance(m_red) <= cook_cut)
+m_red_noinf <- lm(form_red, data = dat[keep_rows, ])
+
+cat("Observations excluded:", nrow(dat) - length(keep_rows),
+    sprintf("(%.1f%%)\n", 100 * (nrow(dat) - length(keep_rows)) / nrow(dat)))
+
+infl_cmp <- tidy_fit(m_red, conf = FALSE) |>
+  select(term, with_all = estimate) |>
+  left_join(tidy_fit(m_red_noinf, conf = FALSE) |>
+              select(term, without_influential = estimate), by = "term") |>
+  mutate(change_pct = 100 * (without_influential - with_all) / abs(with_all),
+         sign_flip = sign(with_all) != sign(without_influential))
+
+infl_cmp |> arrange(desc(abs(change_pct))) |>
+  kable(digits = 3,
+        caption = "Effect of removing high-influence observations on the coefficients")
+
+cat(sprintf("Sign flips: %d | largest relative change: %.1f%% (%s)\n",
+            sum(infl_cmp$sign_flip, na.rm = TRUE),
+            max(abs(infl_cmp$change_pct), na.rm = TRUE),
+            infl_cmp$term[which.max(abs(infl_cmp$change_pct))]))
+```
+
+## Sensitivity 4 --- predictor set
+
+```{r sens-predset, cache=TRUE}
+form_lasso <- if (PKG$glmnet && exists("cv_list") && exists("extract_coefs")) {
+  sel <- extract_coefs(cv_list[["alpha_1"]], "Lasso") |>
+    filter(estimate != 0) |> pull(term)
+  sel <- intersect(make.names(sel), make.names(c(PRED_FULL, "year_c")))
+  if (length(sel) < 2) form_red else
+    stats::reformulate(c(sel, "status"), response = "life_expectancy")
+} else form_red
+
+sens_specs <- list(
+  "Full predictor set"  = function(P) stats::predict(lm(form_full,  data = P$tr), newdata = P$te),
+  "VIF-pruned set"      = function(P) stats::predict(lm(form_red,   data = P$tr), newdata = P$te),
+  "Lasso-selected set"  = function(P) stats::predict(lm(form_lasso, data = P$tr), newdata = P$te)
+)
+
+summarise_cv(run_cv(foldid, sens_specs, data = panel)) |>
+  kable(digits = 3, caption = "Grouped-CV error under three predictor sets")
+```
+
+## Sensitivity 5 --- how much did the leakage actually cost?
+
+```{r sens-leakage, cache=TRUE}
+# WRONG ON PURPOSE: preprocessing already applied to the whole panel, then split.
+run_cv_leaky <- function(folds, specs, data = dat_imp) {
+  out <- list()
+  for (f in sort(unique(folds))) {
+    itr <- which(folds != f); ite <- which(folds == f)
+    tr <- data[itr, ]; te <- data[ite, ]
+    M  <- build_matrix(tr, te)
+    P  <- list(tr = tr, te = te, Xtr = M$Xtr, Xte = M$Xte,
+               ytr = tr$life_expectancy, yte = te$life_expectancy)
+    for (nm in names(specs)) {
+      pred <- tryCatch(specs[[nm]](P), error = function(e) rep(NA_real_, length(ite)))
+      out[[length(out) + 1]] <- tibble(model = nm, fold = f, obs = P$yte,
+                                       pred = as.numeric(pred))
+    }
+  }
+  bind_rows(out)
+}
+
+leak_specs <- specs_grouped[intersect(c("Multiple regression", "Elastic net",
+                                        "Random forest"), names(specs_grouped))]
+leak_cmp <- bind_rows(
+  summarise_cv(run_cv_leaky(foldid, leak_specs)) |>
+    mutate(pipeline = "Impute full panel -> split (leaky)"),
+  summarise_cv(run_cv(foldid, leak_specs, data = panel)) |>
+    mutate(pipeline = "Split -> fit preprocessing on train (correct)")
+) |>
+  select(pipeline, model, RMSE_oof, R2_oof) |>
+  arrange(model, pipeline)
+
+kable(leak_cmp, digits = 4,
+      caption = "Reported error under the leaky and the corrected pipelines")
+```
+
+```{r sens-leakage-gap}
+leak_gap <- leak_cmp |>
+  group_by(model) |>
+  summarise(rmse_understated_by =
+              RMSE_oof[grepl("correct", pipeline)] - RMSE_oof[grepl("leaky", pipeline)],
+            .groups = "drop")
+kable(leak_gap, digits = 4,
+      caption = "How much the leaky pipeline understated the error (years of RMSE)")
+```
+
+## Verdict
+
+```{r sens-verdict}
+tibble(
+  perturbation = c("Complete case vs imputed", "Single vs multiple imputation",
+                   "Imputation model ignores country", "With vs without influential points",
+                   "Predictor set", "Grouped CV vs temporal split",
+                   "Leaky vs fold-wise preprocessing"),
+  affects = c("Coefficient magnitudes (small), sample composition (large)",
+              "Standard errors (inflated), point estimates (stable)",
+              "Understates between-country variation - documented, not fixed",
+              "Coefficient magnitudes (small)",
+              "Predictive error (small), coefficient interpretation (large)",
+              "Model ranking (moderate) - the two schemes answer different questions",
+              "Reported error (measured above); the correct pipeline is the one used")
+) |>
+  kable(caption = "Summary of the sensitivity analyses")
+```
